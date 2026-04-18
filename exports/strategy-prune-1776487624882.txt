@@ -1,0 +1,231 @@
+{
+  "generatedAt": "2026-04-18T04:47:04.883Z",
+  "kept": [
+    {
+      "id": "BTCUSDT-long-1m-1",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "1m",
+      "weightedScore": 37.37591,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BTCUSDT-long-2h-1776484799999",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "2h",
+      "weightedScore": 37.282891,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BTCUSDT-long-2h-1776448799999",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "2h",
+      "weightedScore": 36.092415,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BTCUSDT-long-30m-1776445199999",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 35.973368,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BTCUSDT-long-1h-1776445199999",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "1h",
+      "weightedScore": 35.973368,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BTCUSDT-long-30m-1776443399999",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 35.913844,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BTCUSDT-long-30m-1776437999999",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 35.735272,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BTCUSDT-long-4h-1776297599999",
+      "pair": "BTCUSDT",
+      "direction": "long",
+      "timeframe": "4h",
+      "weightedScore": 31.092415,
+      "trades": 1,
+      "netPnl": 7.0964
+    },
+    {
+      "id": "BNBUSDT-long-2h-1776477599999",
+      "pair": "BNBUSDT",
+      "direction": "long",
+      "timeframe": "2h",
+      "weightedScore": 19.66849,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "BNBUSDT-long-1h-1776477599999",
+      "pair": "BNBUSDT",
+      "direction": "long",
+      "timeframe": "1h",
+      "weightedScore": 19.66849,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "ETHUSDT-long-1h-1776466799999",
+      "pair": "ETHUSDT",
+      "direction": "long",
+      "timeframe": "1h",
+      "weightedScore": 19.311347,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "SOLUSDT-short-15m-1776462299999",
+      "pair": "SOLUSDT",
+      "direction": "short",
+      "timeframe": "15m",
+      "weightedScore": 19.162537,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "SOLUSDT-short-15m-1776458699999",
+      "pair": "SOLUSDT",
+      "direction": "short",
+      "timeframe": "15m",
+      "weightedScore": 19.04349,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "BNBUSDT-long-2h-1776448799999",
+      "pair": "BNBUSDT",
+      "direction": "long",
+      "timeframe": "2h",
+      "weightedScore": 18.716109,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "ETHUSDT-long-30m-1776445199999",
+      "pair": "ETHUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 18.597061,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "BNBUSDT-long-30m-1776445199999",
+      "pair": "BNBUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 18.597061,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "ETHUSDT-long-1h-1776445199999",
+      "pair": "ETHUSDT",
+      "direction": "long",
+      "timeframe": "1h",
+      "weightedScore": 18.597061,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "XRPUSDT-long-2h-1776441599999",
+      "pair": "XRPUSDT",
+      "direction": "long",
+      "timeframe": "2h",
+      "weightedScore": 18.478013,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "SOLUSDT-long-2h-1776441599999",
+      "pair": "SOLUSDT",
+      "direction": "long",
+      "timeframe": "2h",
+      "weightedScore": 18.478013,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "XRPUSDT-long-4h-1776441599999",
+      "pair": "XRPUSDT",
+      "direction": "long",
+      "timeframe": "4h",
+      "weightedScore": 18.478013,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "SOLUSDT-long-4h-1776441599999",
+      "pair": "SOLUSDT",
+      "direction": "long",
+      "timeframe": "4h",
+      "weightedScore": 18.478013,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "XRPUSDT-long-30m-1776437999999",
+      "pair": "XRPUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 18.358966,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "ETHUSDT-long-30m-1776437999999",
+      "pair": "ETHUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 18.358966,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "SOLUSDT-long-30m-1776437999999",
+      "pair": "SOLUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 18.358966,
+      "trades": 0,
+      "netPnl": 0
+    },
+    {
+      "id": "BNBUSDT-long-30m-1776437999999",
+      "pair": "BNBUSDT",
+      "direction": "long",
+      "timeframe": "30m",
+      "weightedScore": 18.358966,
+      "trades": 0,
+      "netPnl": 0
+    }
+  ],
+  "removed": []
+}
