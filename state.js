@@ -1,9 +1,17 @@
 const fs = require("fs");
 const path = require("path");
-const { execFileSync } = require("child_process");
+const { spawnSync } = require("child_process");
 const config = require("./config");
 const defaultPairs = require("./pair");
 const { encryptSecret, decryptSecret, fingerprintSecret } = require("./security");
+
+const DB_PATH =
+  config.sqlitePath ||
+  config.sqliteDbPath ||
+  config.databasePath ||
+  config.dbPath ||
+  config.stateDbPath ||
+  path.join(config.storageDir || path.join(__dirname, "storage"), "state.sqlite");
 
 const SETTINGS_KEYS = {
   legacyMigrated: "__legacyMigrated",
@@ -120,11 +128,19 @@ function readLegacyJson(filePath, fallback = null) {
   }
 }
 
-function runSql(sql) {
-  const result = spawnSync("sqlite3", ["-batch", DB_PATH], {
-    input: `${sql}\n`,
+function runSql(sql, options = {}) {
+  const args = ["-batch"];
+
+  if (options.json) {
+    args.push("-json");
+  }
+
+  args.push(DB_PATH);
+
+  const result = spawnSync("sqlite3", args, {
+    input: `${String(sql || "").trim()}\n`,
     encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 100
+    maxBuffer: 1024 * 1024 * 100,
   });
 
   if (result.error) {
@@ -137,15 +153,24 @@ function runSql(sql) {
 
   return result.stdout || "";
 }
-}
 
 function execute(sql) {
   runSql(sql);
 }
 
 function selectRows(sql) {
-  const raw = (sql, { json: true }).trim();
-  return raw ? JSON.parse(raw) : [];
+  const raw = runSql(sql, { json: true }).trim();
+
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    throw new Error(`sqlite json parse failure: ${error.message}; output=${raw.slice(0, 500)}`);
+  }
 }
 
 function selectOne(sql, fallback = null) {
@@ -574,7 +599,7 @@ function hydrateProfile(row, { includeSecret = false } = {}) {
     status: row.status || "ACTIVE",
     automationStatus: row.automation_status || "NOT_CONFIGURED",
     automationEnabled: Boolean(Number(row.automation_enabled || 0)),
-    walletEnabled: !row.wallet_enabled || Boolean(Number(row.wallet_enabled)),
+    walletEnabled: row.wallet_enabled == null ? true : Boolean(Number(row.wallet_enabled)),
     role: row.role || "USER",
     lastError: row.last_error || null,
     createdAt: row.created_at || null,
@@ -1585,12 +1610,13 @@ function listAutomationRequests(status = null) {
 }
 
 function updateAutomationRequestStatus(requestId, status, { actorUserId = null, reason = null } = {}) {
+  const normalizedStatus = String(status || "").trim().toUpperCase();
   const request = listAutomationRequests().find((item) => item.id === safeInteger(requestId, 0));
   if (!request) return null;
   const reviewedAt = nowIso();
   execute(`
     UPDATE automation_requests
-    SET status = ${sqlQuote(status)},
+    SET status = ${sqlQuote(normalizedStatus)},
         rejection_reason = ${reason ? sqlQuote(reason) : "NULL"},
         reviewed_by = ${actorUserId ? sqlQuote(String(actorUserId)) : "NULL"},
         reviewed_at = ${sqlQuote(reviewedAt)}
@@ -1605,18 +1631,22 @@ function updateAutomationRequestStatus(requestId, status, { actorUserId = null, 
       walletEnabled: profile.walletEnabled,
     };
     const nextStatus =
-      status === "APPROVED" ? "APPROVED" : status === "REJECTED" ? "REJECTED" : profile.automationStatus;
+      normalizedStatus === "APPROVED"
+        ? "APPROVED"
+        : normalizedStatus === "REJECTED"
+          ? "REJECTED"
+          : profile.automationStatus;
     const updated = upsertProfile({
       ...profile,
       automationStatus: nextStatus,
-      automationEnabled: status === "APPROVED" ? true : false,
-      walletEnabled: status === "APPROVED" ? profile.walletEnabled : false,
-      status: status === "APPROVED" ? "ACTIVE" : profile.status,
+      automationEnabled: normalizedStatus === "APPROVED",
+      walletEnabled: normalizedStatus === "APPROVED" ? profile.walletEnabled : false,
+      status: normalizedStatus === "APPROVED" ? "ACTIVE" : profile.status,
     });
     appendAuditLog({
       profileId: profile.id,
       actorUserId,
-      action: status === "APPROVED" ? "automation-approved" : "automation-rejected",
+      action: normalizedStatus === "APPROVED" ? "automation-approved" : "automation-rejected",
       reason,
       oldValue,
       newValue: {
