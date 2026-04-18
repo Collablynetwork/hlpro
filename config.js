@@ -133,11 +133,7 @@ module.exports = {
   alertThreshold: Number(process.env.ALERT_THRESHOLD || 90),
   scoreRiseThreshold: Number(process.env.SCORE_RISE_THRESHOLD || 5),
   notifyMinScore,
-
-  allowedBaseTimeframes: ["1m", "5m"],
-  minSupportCount: Number(process.env.MIN_SUPPORT_COUNT || 3),
-  systemTargetAdjustPct: Number(process.env.SYSTEM_TARGET_ADJUST_PCT || 0.1),
-  systemStopAdjustPct: Number(process.env.SYSTEM_STOP_ADJUST_PCT || 0.1),
+  notifyAboveScore: notifyMinScore,
 
   scanAllValidUsdtPairs:
     String(process.env.SCAN_ALL_VALID_USDT_PAIRS || "false").toLowerCase() === "true",
@@ -155,34 +151,34 @@ module.exports = {
   strategiesDir,
   strategiesIndexPath: path.join(strategiesDir, "index.json"),
 
-  supportedKlineIntervals: ["1m", "5m", "15m", "30m", "1h", "2h", "4h"],
+  supportedKlineIntervals: [
+    "1m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h", "12h",
+    "1d", "3d", "1w",
+  ],
 
   scanKlineIntervals: parseIntervalList(process.env.SCAN_KLINE_INTERVALS, [
-    "1m", "5m", "15m", "30m", "1h", "2h", "4h",
+    "1m", "5m", "15m", "30m",
+    "1h", "2h", "4h", "6h", "8h", "12h",
+    "1d", "3d", "1w",
   ]),
-  strategyLearningIntervals: parseIntervalList(
-    process.env.STRATEGY_LEARNING_INTERVALS,
-    parseIntervalList(process.env.SCAN_KLINE_INTERVALS, [
-      "1m", "5m", "15m", "30m", "1h", "2h", "4h",
-    ])
-  ),
-  strategyLearningLookbackMs: Number(
-    process.env.STRATEGY_LEARNING_LOOKBACK_MS || 3 * 24 * 60 * 60 * 1000
-  ),
-  strategyLearningMaxLookbackMs: Number(
-    process.env.STRATEGY_LEARNING_MAX_LOOKBACK_MS || 7 * 24 * 60 * 60 * 1000
-  ),
-  strategyLearningMinCandles: Math.max(
-    25,
-    Math.trunc(Number(process.env.STRATEGY_LEARNING_MIN_CANDLES || 30))
-  ),
 
-  supportedFlowPeriods: ["5m", "15m", "30m", "1h", "4h"],
+  supportedFlowPeriods: ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"],
 
   timeframeHierarchyMap: {
     "1m": ["1m", "5m", "15m"],
     "5m": ["5m", "15m", "30m", "1h"],
     "15m": ["15m", "30m", "1h", "4h"],
+    "30m": ["30m", "1h", "2h", "4h"],
+    "1h": ["1h", "2h", "4h", "1d"],
+    "2h": ["2h", "4h", "6h", "1d"],
+    "4h": ["4h", "6h", "12h", "1d", "3d"],
+    "6h": ["6h", "12h", "1d", "3d"],
+    "8h": ["8h", "12h", "1d", "3d"],
+    "12h": ["12h", "1d", "3d", "1w"],
+    "1d": ["4h", "12h", "1d", "3d", "1w"],
+    "3d": ["12h", "1d", "3d", "1w"],
+    "1w": ["1d", "3d", "1w"],
   },
 
   strategyCap: Math.max(1, Math.trunc(Number(process.env.STRATEGY_CAP || 500))),

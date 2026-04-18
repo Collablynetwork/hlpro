@@ -145,9 +145,12 @@ Strategy maintenance:
 - `/strategyexports`
 - `/importstrategies latest`
 - `/importstrategies strategies-1234567890.txt`
+- `/importstrategyfile /abs/path/file.json`
+- `/importstrategyfile replace /abs/path/file.txt`
 - `/strategyretention`
 - `/setstrategyretentiondays 7`
 - `/setstrategycap 500`
+- `/cleardemohistory`
 
 Legacy strategy utilities:
 

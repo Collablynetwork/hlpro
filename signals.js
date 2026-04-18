@@ -58,78 +58,24 @@ function buildSignalKey(candidate) {
   ].join("|");
 }
 
-function uniqueStrings(values) {
-  return [...new Set((values || []).map((value) => String(value).trim()).filter(Boolean))];
-}
-
-function chooseStopAndTargets(side, entry, currentFeatures = {}) {
-  const atr = Number(currentFeatures.atr14 || 0);
-  const minRisk = Math.max(entry * 0.003, atr * 1.1, entry * 0.0015);
-  const longSupport = Number(currentFeatures.support);
-  const shortResistance = Number(currentFeatures.resistance);
-  const recentLow = Number(currentFeatures.recentLow20);
-
-  let sl;
-
-  if (side === "LONG") {
-    const stopCandidate =
-      Number.isFinite(longSupport) && longSupport > 0 && longSupport < entry
-        ? longSupport
-        : entry - minRisk;
-    sl = Math.min(stopCandidate, entry - Math.max(minRisk * 0.5, entry * 0.001));
-    const risk = Math.max(entry - sl, minRisk);
-    return {
-      systemTp1: entry + risk,
-      systemSl: sl,
-      riskReward: risk > 0 ? 1 : null,
-    };
-  }
-
-  const stopCandidate =
-    Number.isFinite(shortResistance) && shortResistance > entry
-      ? shortResistance
-      : entry + minRisk;
-  sl = Math.max(stopCandidate, entry + Math.max(minRisk * 0.5, entry * 0.001));
-  const risk = Math.max(sl - entry, minRisk);
-
-  return {
-    systemTp1: Number.isFinite(recentLow) ? Math.min(entry - risk, recentLow) : entry - risk,
-    systemSl: sl,
-    riskReward: risk > 0 ? 1 : null,
-  };
+function toNumOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 function buildSignalCandidate(matchResult) {
   if (!matchResult) return null;
-  const score = Number(matchResult.score);
+  const score = Number(matchResult.score || 0);
   if (!Number.isFinite(score)) return null;
-  if (score <= Number(config.notifyMinScore || 80)) return null;
+
+  if (!(score > Number(config.notifyAboveScore || config.notifyMinScore || 80))) {
+    return null;
+  }
 
   const side =
     String(matchResult.side || matchResult.direction || "LONG").toUpperCase() === "SHORT"
       ? "SHORT"
       : "LONG";
-  const baseTimeframe = matchResult.baseTimeframe || matchResult.baseTf || "N/A";
-  if (!config.allowedBaseTimeframes.includes(baseTimeframe)) return null;
-
-  const currentFeatures = matchResult.current?.features || {};
-  const entry = Number(
-    matchResult.entry ?? matchResult.entryPrice ?? currentFeatures.currentClose ?? 0
-  );
-  if (!Number.isFinite(entry) || entry <= 0) return null;
-
-  const supportTfsRaw =
-    matchResult.supportTfs ||
-    matchResult.supportTimeframes ||
-    matchResult.supportingTimeframes ||
-    matchResult.validationTfs ||
-    [];
-  const supportTfs = uniqueStrings([baseTimeframe, ...supportTfsRaw]);
-  if (supportTfs.length < Number(config.minSupportCount || 3)) return null;
-
-  const generated = chooseStopAndTargets(side, entry, currentFeatures);
-  const targetPrice = Number(matchResult.tp1 ?? generated.systemTp1);
-  const stopLoss = Number(matchResult.sl ?? matchResult.stopLoss ?? generated.systemSl);
   const strategySourcePair =
     matchResult.strategySourcePair || matchResult.sourcePair || matchResult.strategy?.pair || "N/A";
   const strategySourceTimeframe =
@@ -144,25 +90,41 @@ function buildSignalCandidate(matchResult) {
     side,
     direction: side,
     score,
-    entry,
-    entryPrice: entry,
-    currentPrice: Number(matchResult.currentPrice ?? currentFeatures.currentClose ?? entry),
-    targetPrice,
-    stopLoss,
-    tp1: targetPrice,
-    sl: stopLoss,
-    baseTimeframe,
-    baseTf: baseTimeframe,
-    supportTfs,
-    supportTimeframes: supportTfs,
+
+    entry: toNumOrNull(matchResult.entry ?? matchResult.entryPrice),
+    entryPrice: toNumOrNull(matchResult.entry ?? matchResult.entryPrice),
+    currentPrice: toNumOrNull(matchResult.currentPrice),
+
+    sl: toNumOrNull(matchResult.sl ?? matchResult.stopLoss),
+    stopLoss: toNumOrNull(matchResult.sl ?? matchResult.stopLoss),
+
+    tp1: toNumOrNull(matchResult.tp1),
+    tp2: toNumOrNull(matchResult.tp2),
+    tp3: toNumOrNull(matchResult.tp3),
+
+    baseTimeframe: matchResult.baseTimeframe || matchResult.baseTf || "N/A",
+    baseTf: matchResult.baseTimeframe || matchResult.baseTf || "N/A",
+    supportTfs:
+      matchResult.supportTfs ||
+      matchResult.supportingTimeframes ||
+      matchResult.supportTimeframes ||
+      matchResult.validationTfs ||
+      [],
+    supportTimeframes:
+      matchResult.supportTfs ||
+      matchResult.supportingTimeframes ||
+      matchResult.supportTimeframes ||
+      matchResult.validationTfs ||
+      [],
     reasons: matchResult.reasons || [],
     strategySourcePair,
     strategySourceTimeframe,
     strategySource: strategyUsed,
     strategyUsed,
     similarityScore: Number(matchResult.similarityScore || score),
-    riskReward: Number(matchResult.riskReward ?? generated.riskReward),
+    riskReward: matchResult.riskReward || null,
     regimeSupportScore: matchResult.regimeSupportScore ?? null,
+    discoveryType: "watched",
   };
 }
 

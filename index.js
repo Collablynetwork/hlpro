@@ -40,7 +40,9 @@ function ensureBotStarted() {
 function timeframeToFlowPeriod(timeframe) {
   const allowed = new Set(config.supportedFlowPeriods);
   if (allowed.has(timeframe)) return timeframe;
-  if (timeframe === "1m") return "5m";
+  if (["1m", "3m"].includes(timeframe)) return "5m";
+  if (timeframe === "8h") return "6h";
+  if (timeframe === "3d" || timeframe === "1w") return "1d";
   return "1h";
 }
 
@@ -51,15 +53,6 @@ function getActiveScanIntervals() {
     : config.supportedKlineIntervals;
   const filtered = configured.filter((timeframe) => supported.has(timeframe));
   return filtered.length ? filtered : config.supportedKlineIntervals;
-}
-
-function getStrategyLearningIntervals() {
-  const supported = new Set(config.supportedKlineIntervals || []);
-  const configured = Array.isArray(config.strategyLearningIntervals)
-    ? config.strategyLearningIntervals
-    : getActiveScanIntervals();
-  const filtered = configured.filter((timeframe) => supported.has(timeframe));
-  return filtered.length ? filtered : getActiveScanIntervals();
 }
 
 function isRateLimitError(error) {
@@ -249,7 +242,7 @@ async function buildTimeframePayload(symbol, timeframe) {
 
 async function buildFeatureStoreForPairs(pairs) {
   const featureStore = {};
-  const scanIntervals = getActiveScanIntervals();
+  const scanIntervals = config.supportedKlineIntervals || [];
   let rateLimited = false;
 
   await mapLimit(pairs, Number(config.maxParallelRequests || 2), async (pair) => {
@@ -276,54 +269,13 @@ async function buildFeatureStoreForPairs(pairs) {
   return featureStore;
 }
 
-async function buildLearningStoreForPairs(pairs, liveFeatureStore = {}) {
-  const learningStore = {};
-  const learningIntervals = getStrategyLearningIntervals();
-  let rateLimited = false;
-
-  await mapLimit(
-    pairs,
-    Math.max(1, Math.min(2, Number(config.maxParallelRequests || 2))),
-    async (pair) => {
-      learningStore[pair] = {};
-
-      for (const timeframe of learningIntervals) {
-        if (rateLimited) break;
-
-        try {
-          const candles = await binance.getKlinesForLookback(pair, timeframe, {
-            lookbackMs: config.strategyLearningLookbackMs,
-            maxLookbackMs: config.strategyLearningMaxLookbackMs,
-            minCandles: config.strategyLearningMinCandles,
-          });
-          learningStore[pair][timeframe] = {
-            candles,
-            flow: liveFeatureStore[pair]?.[timeframe]?.flow || {},
-          };
-        } catch (error) {
-          const message = error?.message || String(error);
-          console.error(`Learning payload skipped ${pair} ${timeframe}:`, message);
-          learningStore[pair][timeframe] = null;
-
-          if (isRateLimitError(error)) {
-            rateLimited = true;
-            break;
-          }
-        }
-      }
-    }
-  );
-
-  return learningStore;
-}
-
 function recentEventsOnly(events) {
   const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
   return events.filter((event) => new Date(event.timestamp).getTime() >= threeDaysAgo);
 }
 
 function extractRegimeSupport(tfMap, direction) {
-  const regimeTfs = ["1h", "2h", "4h"];
+  const regimeTfs = ["1d", "3d", "1w"];
   let score = 0;
 
   for (const tf of regimeTfs) {
@@ -331,13 +283,13 @@ function extractRegimeSupport(tfMap, direction) {
     if (!features) continue;
 
     if (direction === "long") {
-      if (features.trend === "uptrend") score += 0.35;
-      if ((features.rangePositionPct ?? 50) > 55) score += 0.15;
-      if ((features.diSpread ?? 0) > 0) score += 0.15;
+      if (features.trend === "uptrend") score += 0.4;
+      if ((features.rangePositionPct ?? 50) > 55) score += 0.2;
+      if ((features.diSpread ?? 0) > 0) score += 0.2;
     } else {
-      if (features.trend === "downtrend") score += 0.35;
-      if ((features.rangePositionPct ?? 50) < 45) score += 0.15;
-      if ((features.diSpread ?? 0) < 0) score += 0.15;
+      if (features.trend === "downtrend") score += 0.4;
+      if ((features.rangePositionPct ?? 50) < 45) score += 0.2;
+      if ((features.diSpread ?? 0) < 0) score += 0.2;
     }
   }
 
@@ -345,7 +297,7 @@ function extractRegimeSupport(tfMap, direction) {
 }
 
 function buildRegimeSupportDetail(tfMap, direction) {
-  const regimeTfs = ["1h", "2h", "4h"];
+  const regimeTfs = ["1d", "3d", "1w"];
   const out = {};
 
   for (const tf of regimeTfs) {
@@ -420,11 +372,6 @@ function findSupportingTimeframes(tfMap, baseTimeframe, direction) {
   for (const tf of stack) {
     const features = tfMap?.[tf]?.features;
     if (!features) continue;
-
-    if (tf === baseTimeframe) {
-      out.push(tf);
-      continue;
-    }
 
     if (direction === "long") {
       const supported =
@@ -512,9 +459,7 @@ async function runScan(options = {}) {
 
     const featureStore = await buildFeatureStoreForPairs(scanPairs);
 
-    const learningStore = await buildLearningStoreForPairs(scanPairs, featureStore);
-
-    let recentLeaders = recentEventsOnly(findRecentPumpLeaders(learningStore));
+    let recentLeaders = recentEventsOnly(findRecentPumpLeaders(featureStore));
     recentLeaders = recentLeaders.map((event) => ({
       ...event,
       regimeSupportScore: extractRegimeSupport(featureStore[event.pair], event.direction),
@@ -535,7 +480,7 @@ async function runScan(options = {}) {
     const candidates = [];
 
     for (const pair of scanPairs) {
-      const match = matchStrategiesForPair(pair, featureStore[pair], strategies, learnedWeights);
+      const match = matchStrategiesForPair(pair, featureStore[pair], strategies);
 
       const longSupport = match.long
         ? findSupportingTimeframes(featureStore[pair], match.long.baseTimeframe, "long")

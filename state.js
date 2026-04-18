@@ -1,17 +1,9 @@
 const fs = require("fs");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { execFileSync } = require("child_process");
 const config = require("./config");
 const defaultPairs = require("./pair");
 const { encryptSecret, decryptSecret, fingerprintSecret } = require("./security");
-
-const DB_PATH =
-  config.sqlitePath ||
-  config.sqliteDbPath ||
-  config.databasePath ||
-  config.dbPath ||
-  config.stateDbPath ||
-  path.join(config.storageDir || path.join(__dirname, "storage"), "state.sqlite");
 
 const SETTINGS_KEYS = {
   legacyMigrated: "__legacyMigrated",
@@ -128,30 +120,21 @@ function readLegacyJson(filePath, fallback = null) {
   }
 }
 
-function runSql(sql, options = {}) {
-  const args = ["-batch"];
+function runSql(sql, { json = false } = {}) {
+  ensureDir(path.dirname(config.sqlitePath));
+  const args = ["-batch", "-cmd", ".timeout 10000"];
+  if (json) args.push("-json");
+  args.push(config.sqlitePath, sql);
 
-  if (options.json) {
-    args.push("-json");
+  try {
+    return execFileSync("sqlite3", args, {
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+    });
+  } catch (error) {
+    const stderr = error.stderr ? String(error.stderr) : error.message;
+    throw new Error(`sqlite failure: ${stderr.trim()}`);
   }
-
-  args.push(DB_PATH);
-
-  const result = spawnSync("sqlite3", args, {
-    input: `${String(sql || "").trim()}\n`,
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024 * 100,
-  });
-
-  if (result.error) {
-    throw new Error(`sqlite failure: ${result.error.message}`);
-  }
-
-  if (result.status !== 0) {
-    throw new Error(`sqlite failure: ${(result.stderr || "").trim()}`);
-  }
-
-  return result.stdout || "";
 }
 
 function execute(sql) {
@@ -160,17 +143,7 @@ function execute(sql) {
 
 function selectRows(sql) {
   const raw = runSql(sql, { json: true }).trim();
-
-  if (!raw) {
-    return [];
-  }
-
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (error) {
-    throw new Error(`sqlite json parse failure: ${error.message}; output=${raw.slice(0, 500)}`);
-  }
+  return raw ? JSON.parse(raw) : [];
 }
 
 function selectOne(sql, fallback = null) {
@@ -599,7 +572,7 @@ function hydrateProfile(row, { includeSecret = false } = {}) {
     status: row.status || "ACTIVE",
     automationStatus: row.automation_status || "NOT_CONFIGURED",
     automationEnabled: Boolean(Number(row.automation_enabled || 0)),
-    walletEnabled: row.wallet_enabled == null ? true : Boolean(Number(row.wallet_enabled)),
+    walletEnabled: !row.wallet_enabled || Boolean(Number(row.wallet_enabled)),
     role: row.role || "USER",
     lastError: row.last_error || null,
     createdAt: row.created_at || null,
@@ -1166,6 +1139,59 @@ function listClosedTradesByProfile(profileId, limit = 0) {
   );
 }
 
+function clearDemoTradeHistory(profileId = DEFAULT_PROFILE_ID) {
+  const normalizedProfileId = normalizeProfileId(profileId);
+  const demoTrades = listClosedTradesByProfile(normalizedProfileId).filter(
+    (trade) => String(trade.executionMode || "").toUpperCase() === "DEMO"
+  );
+
+  if (!demoTrades.length) {
+    return {
+      profileId: normalizedProfileId,
+      deleted: 0,
+      pairsReset: 0,
+      tradeIds: [],
+    };
+  }
+
+  const deletedTradeIds = [...new Set(
+    demoTrades
+      .map((trade) => String(trade.id || "").trim())
+      .filter(Boolean)
+  )];
+
+  execute(`
+    DELETE FROM trades
+    WHERE status IN (${TERMINAL_TRADE_STATUSES.map(sqlQuote).join(", ")})
+      AND profile_id = ${sqlQuote(normalizedProfileId)}
+      AND execution_mode = 'DEMO';
+  `);
+
+  let pairsReset = 0;
+  const deletedIdSet = new Set(deletedTradeIds);
+  for (const pairState of listPairStates(normalizedProfileId)) {
+    if (!deletedIdSet.has(String(pairState.lastTradeId || "").trim())) continue;
+    savePairState(normalizedProfileId, pairState.pair, {
+      ...pairState,
+      lastTradeId: null,
+      lastClosedAt: null,
+      lastSide: null,
+      lastEntryPrice: null,
+      repeatLevel: 0,
+      cooldownUntil: null,
+      lastExitReason: null,
+    });
+    pairsReset += 1;
+  }
+
+  return {
+    profileId: normalizedProfileId,
+    deleted: demoTrades.length,
+    pairsReset,
+    tradeIds: deletedTradeIds,
+  };
+}
+
 function listAllTrades(profileId = null) {
   return hydrateRows(
     selectRows(`
@@ -1610,13 +1636,12 @@ function listAutomationRequests(status = null) {
 }
 
 function updateAutomationRequestStatus(requestId, status, { actorUserId = null, reason = null } = {}) {
-  const normalizedStatus = String(status || "").trim().toUpperCase();
   const request = listAutomationRequests().find((item) => item.id === safeInteger(requestId, 0));
   if (!request) return null;
   const reviewedAt = nowIso();
   execute(`
     UPDATE automation_requests
-    SET status = ${sqlQuote(normalizedStatus)},
+    SET status = ${sqlQuote(status)},
         rejection_reason = ${reason ? sqlQuote(reason) : "NULL"},
         reviewed_by = ${actorUserId ? sqlQuote(String(actorUserId)) : "NULL"},
         reviewed_at = ${sqlQuote(reviewedAt)}
@@ -1631,22 +1656,18 @@ function updateAutomationRequestStatus(requestId, status, { actorUserId = null, 
       walletEnabled: profile.walletEnabled,
     };
     const nextStatus =
-      normalizedStatus === "APPROVED"
-        ? "APPROVED"
-        : normalizedStatus === "REJECTED"
-          ? "REJECTED"
-          : profile.automationStatus;
+      status === "APPROVED" ? "APPROVED" : status === "REJECTED" ? "REJECTED" : profile.automationStatus;
     const updated = upsertProfile({
       ...profile,
       automationStatus: nextStatus,
-      automationEnabled: normalizedStatus === "APPROVED",
-      walletEnabled: normalizedStatus === "APPROVED" ? profile.walletEnabled : false,
-      status: normalizedStatus === "APPROVED" ? "ACTIVE" : profile.status,
+      automationEnabled: status === "APPROVED" ? true : false,
+      walletEnabled: status === "APPROVED" ? profile.walletEnabled : false,
+      status: status === "APPROVED" ? "ACTIVE" : profile.status,
     });
     appendAuditLog({
       profileId: profile.id,
       actorUserId,
-      action: normalizedStatus === "APPROVED" ? "automation-approved" : "automation-rejected",
+      action: status === "APPROVED" ? "automation-approved" : "automation-rejected",
       reason,
       oldValue,
       newValue: {
@@ -1992,6 +2013,7 @@ module.exports = {
   listOpenTrades,
   listClosedTrades,
   listClosedTradesByProfile,
+  clearDemoTradeHistory,
   listAllTrades,
   findOpenTradeByPair,
   getPairState,

@@ -26,18 +26,16 @@ hyperliquid.getAllMids = async () => ({ BTC: 100 });
 function makeMatch(overrides = {}) {
   return {
     pair: "BTCUSDT",
-    direction: "long",
+    side: "LONG",
     score: 88,
     baseTimeframe: "1m",
-    current: {
-      features: {
-        currentClose: 100,
-        atr14: 0.5,
-        support: 99.2,
-        resistance: 101.8,
-        recentLow20: 98.7,
-      },
-    },
+    entry: 100,
+    entryPrice: 100,
+    currentPrice: 100,
+    sl: 99.2,
+    tp1: 100.8,
+    tp2: 101.6,
+    tp3: 102.4,
     supportTimeframes: ["1m", "5m", "15m"],
     reasons: ["rule A", "rule B"],
     ...overrides,
@@ -63,20 +61,15 @@ assert.strictEqual(runtime.simpleSlots, 1);
 state.saveWatchedPairs(profile.id, ["DOGEUSDT"]);
 assert.deepStrictEqual(state.getWatchedPairs(profile.id), ["DOGEUSDT"]);
 
-assert.strictEqual(
-  signals.buildSignalCandidate(makeMatch({ baseTimeframe: "15m" })),
-  null,
-  "15m should be rejected"
-);
-assert.strictEqual(
-  signals.buildSignalCandidate(makeMatch({ supportTimeframes: ["1m", "5m"] })),
-  null,
-  "Need at least 3 support timeframes"
-);
+assert(signals.buildSignalCandidate(makeMatch({ baseTimeframe: "15m" })), "15m should be allowed");
+assert(signals.buildSignalCandidate(makeMatch({ supportTimeframes: ["1m", "5m"] })), "Support count should not hard-block");
 
 const candidate = signals.buildSignalCandidate(makeMatch());
-assert(candidate, "1m candidate with 3 supports should pass");
-assert.strictEqual(candidate.targetPrice.toFixed(4), "100.8000");
+assert(candidate, "Signal candidate should pass old gate");
+assert.strictEqual(candidate.entryPrice.toFixed(4), "100.0000");
+assert.strictEqual(candidate.tp1.toFixed(4), "100.8000");
+assert.strictEqual(candidate.tp2.toFixed(4), "101.6000");
+assert.strictEqual(candidate.tp3.toFixed(4), "102.4000");
 assert.strictEqual(candidate.stopLoss.toFixed(4), "99.2000");
 
 let allocation = tradeManager.buildAllocationPlan(candidate, profile.id);

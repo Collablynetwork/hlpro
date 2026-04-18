@@ -38,7 +38,9 @@ const COMMANDS = [
   { command: "strategystatus", description: "Show strategy status" },
   { command: "exportstrategies", description: "Export learned strategies" },
   { command: "importstrategies", description: "Import saved strategies" },
+  { command: "importstrategyfile", description: "Import a local strategy file" },
   { command: "strategyexports", description: "List strategy backups" },
+  { command: "cleardemohistory", description: "Clear closed demo trade history" },
   { command: "admin", description: "Open admin panel" },
 ];
 
@@ -105,7 +107,18 @@ function createBot(options = {}) {
     typeof options.polling === "boolean" ? options.polling : config.telegramPolling;
 
   return new TelegramBot(config.telegramBotToken, {
-    polling,
+    polling: polling
+      ? {
+          autoStart: true,
+          interval: 1000,
+          params: {
+            timeout: 20,
+          },
+        }
+      : false,
+    request: {
+      timeout: 30_000,
+    },
   });
 }
 
@@ -229,6 +242,43 @@ function resolveStrategyExportFile(selector = "latest") {
   return exports.find((item) => item.name === normalized) || null;
 }
 
+function stripWrappedQuotes(value) {
+  const text = String(value || "").trim();
+  if (
+    (text.startsWith('"') && text.endsWith('"')) ||
+    (text.startsWith("'") && text.endsWith("'"))
+  ) {
+    return text.slice(1, -1).trim();
+  }
+  return text;
+}
+
+function parseImportPathArgs(argsText = "") {
+  const raw = String(argsText || "").trim();
+  if (!raw) {
+    return { replace: false, filePath: "" };
+  }
+
+  const lower = raw.toLowerCase();
+  if (lower.startsWith("replace ")) {
+    return {
+      replace: true,
+      filePath: stripWrappedQuotes(raw.slice("replace ".length)),
+    };
+  }
+  if (lower.startsWith("merge ")) {
+    return {
+      replace: false,
+      filePath: stripWrappedQuotes(raw.slice("merge ".length)),
+    };
+  }
+
+  return {
+    replace: false,
+    filePath: stripWrappedQuotes(raw),
+  };
+}
+
 function normalizeTradeStatus(trade) {
   return String(trade?.status || "").toUpperCase();
 }
@@ -330,9 +380,11 @@ function buildHelpText() {
     "/exportstrategies",
     "/importstrategies latest",
     "/importstrategies strategies-1234567890.txt",
+    "/importstrategyfile /abs/path/file.json",
     "/strategyexports",
     "/setstrategycap 500",
     "/setstrategyretentiondays 7",
+    "/cleardemohistory",
     "",
     "Admin",
     "/admin",
@@ -1772,6 +1824,28 @@ async function importStrategiesFromFile(
   return importStrategiesFromText(bot, chatId, rawText, fileRecord.name, { userId, replace });
 }
 
+async function importStrategiesFromExternalPath(
+  bot,
+  chatId,
+  rawFilePath,
+  { userId = null, replace = false } = {}
+) {
+  const normalizedPath = path.resolve(stripWrappedQuotes(rawFilePath || ""));
+  if (!normalizedPath || !fs.existsSync(normalizedPath) || !fs.statSync(normalizedPath).isFile()) {
+    await sendInvalidInput(
+      bot,
+      chatId,
+      "External strategy file not found.",
+      ["/importstrategyfile /abs/path/file.json", "/importstrategyfile replace /abs/path/file.txt"],
+      { userId, backScreen: SCREEN.STRATEGIES }
+    );
+    return null;
+  }
+
+  const rawText = fs.readFileSync(normalizedPath, "utf8");
+  return importStrategiesFromText(bot, chatId, rawText, normalizedPath, { userId, replace });
+}
+
 async function listStrategyExports(bot, chatId, { userId = null } = {}) {
   const exports = listStrategyExportFiles(10);
   if (!exports.length) {
@@ -2443,6 +2517,20 @@ async function handleCommand(bot, msg, parsed, callbacks) {
       await showScreen(bot, msg, SCREEN.CLOSED, { profile });
       return;
 
+    case "cleardemohistory": {
+      const summary = state.clearDemoTradeHistory(profile.id);
+      await sendToUser(
+        [
+          "🧹 Demo Trade History Cleared",
+          `Deleted Closed Demo Trades: ${summary.deleted}`,
+          `Reset Pair States: ${summary.pairsReset}`,
+          "Open trades and balances were not changed.",
+        ].join("\n"),
+        inlineKeyboard([[button("⬅️ Back", screenCallback(SCREEN.CLOSED))]])
+      );
+      return;
+    }
+
     case "pnl": {
       const filters = {};
       for (const token of args.map((arg) => String(arg).toLowerCase())) {
@@ -2978,6 +3066,24 @@ async function handleCommand(bot, msg, parsed, callbacks) {
       return;
     }
 
+    case "importstrategyfile": {
+      if (!(await requireAdmin())) return;
+      const { replace, filePath } = parseImportPathArgs(argsText);
+      if (!filePath) {
+        await sendInvalidInput(
+          bot,
+          chatId,
+          "Missing external strategy file path.",
+          ["/importstrategyfile /abs/path/file.json", "/importstrategyfile replace /abs/path/file.txt"],
+          { userId, backScreen: SCREEN.STRATEGIES }
+        );
+        return;
+      }
+
+      await importStrategiesFromExternalPath(bot, chatId, filePath, { userId, replace });
+      return;
+    }
+
     case "strategyretention":
       await showScreen(bot, msg, SCREEN.STRATEGIES, { profile });
       return;
@@ -3454,6 +3560,10 @@ function registerHandlers(bot, callbacks) {
   });
 
   bot.on("polling_error", (error) => {
+    if (/ETIMEDOUT|ECONNRESET|socket hang up/i.test(String(error?.message || ""))) {
+      console.warn("Telegram polling warning:", error?.message || "polling-timeout");
+      return;
+    }
     console.error("Telegram polling error:", {
       code: error?.code || null,
       message: error?.message || null,
