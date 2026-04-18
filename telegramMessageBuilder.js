@@ -160,12 +160,12 @@ function buildEntryFilledMessage(trade) {
 
 function buildProtectiveOrdersPlacedMessage(trade) {
   return [
-    `🛡️ TP & SL ARMED [${modeTag(trade)}]`,
+    `🛡️ TP/SL MONITORING STARTED [${modeTag(trade)}]`,
     `🪙 Pair: ${trade.pair}`,
     `🌐 Hyperliquid: ${hyperliquidLink(trade.pair)}`,
     `🏁 TP: ${formatPrice(trade.targetPrice)} | ID: ${trade.tpOrderId || "N/A"}`,
     `🛑 SL: ${formatPrice(trade.stopLoss)} | ID: ${trade.slOrderId || "N/A"}`,
-    `Trade is now protected.`,
+    `TP/SL monitoring is now active.`,
   ].join("\n");
 }
 
