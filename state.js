@@ -120,21 +120,23 @@ function readLegacyJson(filePath, fallback = null) {
   }
 }
 
-function runSql(sql, { json = false } = {}) {
-  ensureDir(path.dirname(config.sqlitePath));
-  const args = ["-batch", "-cmd", ".timeout 10000"];
-  if (json) args.push("-json");
-  args.push(config.sqlitePath, sql);
+function runSql(sql) {
+  const result = spawnSync("sqlite3", ["-batch", DB_PATH], {
+    input: `${sql}\n`,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 100
+  });
 
-  try {
-    return execFileSync("sqlite3", args, {
-      encoding: "utf8",
-      maxBuffer: 20 * 1024 * 1024,
-    });
-  } catch (error) {
-    const stderr = error.stderr ? String(error.stderr) : error.message;
-    throw new Error(`sqlite failure: ${stderr.trim()}`);
+  if (result.error) {
+    throw new Error(`sqlite failure: ${result.error.message}`);
   }
+
+  if (result.status !== 0) {
+    throw new Error(`sqlite failure: ${(result.stderr || "").trim()}`);
+  }
+
+  return result.stdout || "";
+}
 }
 
 function execute(sql) {
@@ -142,7 +144,7 @@ function execute(sql) {
 }
 
 function selectRows(sql) {
-  const raw = runSql(sql, { json: true }).trim();
+  const raw = (sql, { json: true }).trim();
   return raw ? JSON.parse(raw) : [];
 }
 
