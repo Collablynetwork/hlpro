@@ -180,6 +180,11 @@ function shortText(value, maxLength = 80) {
   return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
 }
 
+function isBenignEditError(error) {
+  const message = String(error?.message || "");
+  return /message is not modified|message to edit not found/i.test(message);
+}
+
 function formatFileSize(bytes) {
   const size = Number(bytes);
   if (!Number.isFinite(size) || size < 0) return "N/A";
@@ -811,7 +816,7 @@ async function sendPrompt(bot, target, profile, kind, backScreen = SCREEN.HOME, 
       await answerCallbackSafe(target.bot, target.id);
       return;
     } catch (error) {
-      if (!/message is not modified/i.test(String(error.message || ""))) {
+      if (!isBenignEditError(error)) {
         console.error("Prompt edit failed:", error.message);
       }
     }
@@ -1668,11 +1673,14 @@ async function showScreen(bot, target, screen, options = {}) {
       await answerCallbackSafe(bot, target.id);
       return;
     } catch (error) {
-      if (/message is not modified/i.test(String(error.message || ""))) {
+      if (isBenignEditError(error)) {
         await answerCallbackSafe(bot, target.id);
-        return;
+        if (/message is not modified/i.test(String(error.message || ""))) {
+          return;
+        }
+      } else {
+        console.error("Screen edit failed:", error.message);
       }
-      console.error("Screen edit failed:", error.message);
     }
   }
 

@@ -227,88 +227,130 @@ function dedupeCandidates(candidates) {
   return [...byKey.values()].sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
 }
 
+function mergeActiveSignal(previous, candidate, band) {
+  return {
+    ...previous,
+    ...candidate,
+    band: previous?.band || band,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function resolveReplyMessageId(update, activeSignals = {}) {
+  const trade = update.trade || {};
+  if (trade.signalMessageId || trade.messageId || update.candidate?.signalMessageId) {
+    return trade.signalMessageId || trade.messageId || update.candidate?.signalMessageId || null;
+  }
+
+  const signalKey = trade.signalKey || update.candidate?.signalKey || null;
+  if (signalKey && activeSignals[signalKey]?.messageId) {
+    return activeSignals[signalKey].messageId;
+  }
+
+  const pair = String(trade.pair || update.candidate?.pair || "").toUpperCase();
+  if (!pair) return null;
+  const fallback = Object.values(activeSignals).find(
+    (entry) => String(entry?.pair || "").toUpperCase() === pair && entry?.messageId
+  );
+  return fallback?.messageId || null;
+}
+
 async function dispatchSignals(bot, chatId, candidates, options = {}) {
   const profileId = options.profileId || state.DEFAULT_PROFILE_ID;
   const deduped = dedupeCandidates(candidates);
   if (!deduped.length) return [];
 
   const activeSignals = state.getActiveSignals(profileId);
+  const signalBudget = tradeManager.getSignalDispatchBudget(profileId);
+  const activePairs = new Set(signalBudget.activePairs || []);
+  const reservedPairs = new Set(signalBudget.activePairs || []);
   const results = [];
   let dirty = false;
 
   for (const candidate of deduped) {
     const signalKey = buildSignalKey(candidate);
+    const pair = String(candidate.pair || "").toUpperCase();
     const band = getBand(candidate.score);
-    const previous = activeSignals[signalKey];
+    const previous = activeSignals[signalKey] || null;
 
-    if (!previous) {
-      const sent = await sendNewSignal(bot, chatId, candidate, { profileId });
-      const candidateWithMessage = {
-        ...candidate,
-        signalKey,
-        signalMessageId: sent?.message_id || null,
-      };
-      const registered = await tradeManager.registerSignal(candidateWithMessage, {
-        profileId,
-        signalMessageId: sent?.message_id || null,
-      });
-      const skipped = registered.events?.some((event) => event.type === "TRADE_SKIPPED");
+    if (previous && !activePairs.has(pair)) {
+      delete activeSignals[signalKey];
+      dirty = true;
+    }
 
-      if (registered.trade && !skipped) {
-        state.setSnapshot(`profile:${profileId}:lastSignal`, {
-          timestamp: new Date().toISOString(),
-          pair: candidate.pair,
-          side: candidate.side,
-          baseTimeframe: candidate.baseTimeframe,
-          score: candidate.score,
-          signalKey,
-        });
-        tradeManager.attachSignalMessage(
-          registered.trade.id || registered.trade.signalId,
-          sent?.message_id || null,
-          signalKey
-        );
-        activeSignals[signalKey] = {
-          ...candidate,
-          band,
-          messageId: sent?.message_id || null,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
+    if (reservedPairs.has(pair)) {
+      if (previous) {
+        activeSignals[signalKey] = mergeActiveSignal(previous, candidate, band);
         dirty = true;
       }
-
-      if (registered.events?.length) {
-        await dispatchTradeUpdates(bot, chatId, registered.events, { profileId });
-      }
-
-      results.push({ type: "new", key: signalKey, candidate });
+      results.push({ type: "suppressed", key: signalKey, candidate, reason: "pair-already-open" });
       continue;
     }
 
-    const scoreRise = Number(candidate.score || 0) - Number(previous.score || 0);
-    const raisedBand = bandRank(band) > bandRank(previous.band);
+    const preview = await tradeManager.previewSignalRegistration(candidate, { profileId });
+    if (!preview.ok) {
+      results.push({
+        type: "suppressed",
+        key: signalKey,
+        candidate,
+        reason: preview.reason || preview.events?.[0]?.reason || "trade-skipped",
+      });
+      continue;
+    }
 
-    if (scoreRise > 0 && (raisedBand || scoreRise >= config.scoreRiseThreshold)) {
-      await sendScoreRise(bot, chatId, previous, candidate);
+    const sent = await sendNewSignal(bot, chatId, candidate, { profileId });
+    reservedPairs.add(pair);
+
+    const candidateWithMessage = {
+      ...candidate,
+      signalKey,
+      signalMessageId: sent?.message_id || null,
+    };
+    const registered = await tradeManager.registerSignal(candidateWithMessage, {
+      profileId,
+      signalMessageId: sent?.message_id || null,
+      prepared: {
+        ...preview,
+        signalMessageId: sent?.message_id || preview.signalMessageId || null,
+      },
+    });
+    const skipped = registered.events?.some((event) => event.type === "TRADE_SKIPPED");
+
+    if (registered.trade && !skipped) {
+      state.setSnapshot(`profile:${profileId}:lastSignal`, {
+        timestamp: new Date().toISOString(),
+        pair: candidate.pair,
+        side: candidate.side,
+        baseTimeframe: candidate.baseTimeframe,
+        score: candidate.score,
+        signalKey,
+      });
+      tradeManager.attachSignalMessage(
+        registered.trade.id || registered.trade.signalId,
+        sent?.message_id || null,
+        signalKey
+      );
       activeSignals[signalKey] = {
-        ...previous,
         ...candidate,
         band,
+        messageId: sent?.message_id || null,
+        createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
+      activePairs.add(pair);
       dirty = true;
-      results.push({ type: "rise", key: signalKey, candidate });
-      continue;
     }
 
-    activeSignals[signalKey] = {
-      ...previous,
-      ...candidate,
-      band: previous.band || band,
-      updatedAt: new Date().toISOString(),
-    };
-    dirty = true;
+    if (registered.events?.length) {
+      await dispatchTradeUpdates(bot, chatId, registered.events, { profileId });
+    }
+
+    results.push({
+      type: skipped ? "suppressed" : "new",
+      key: signalKey,
+      candidate,
+      reason: skipped ? registered.events?.find((event) => event.type === "TRADE_SKIPPED")?.reason : null,
+    });
   }
 
   if (dirty) {
@@ -367,8 +409,7 @@ async function dispatchTradeUpdates(bot, chatId, updates, options = {}) {
 
   for (const update of updates) {
     const trade = update.trade || {};
-    const replyTo =
-      trade.signalMessageId || trade.messageId || update.candidate?.signalMessageId || null;
+    const replyTo = resolveReplyMessageId(update, activeSignals);
     const text = eventMessage(update);
 
     if (!text) continue;
@@ -381,9 +422,21 @@ async function dispatchTradeUpdates(bot, chatId, updates, options = {}) {
     sent.push(message);
 
     const signalKey = trade.signalKey || update.candidate?.signalKey || null;
-    if (signalKey && activeSignals[signalKey] && isTerminalEvent(update)) {
-      delete activeSignals[signalKey];
-      dirty = true;
+    if (isTerminalEvent(update)) {
+      if (signalKey && activeSignals[signalKey]) {
+        delete activeSignals[signalKey];
+        dirty = true;
+      }
+
+      const pair = String(trade.pair || update.candidate?.pair || "").toUpperCase();
+      if (pair) {
+        for (const [key, value] of Object.entries(activeSignals)) {
+          if (String(value?.pair || "").toUpperCase() === pair) {
+            delete activeSignals[key];
+            dirty = true;
+          }
+        }
+      }
     }
   }
 

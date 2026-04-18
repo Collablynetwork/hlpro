@@ -801,7 +801,42 @@ function canOpenNewSignal(profileId, pair) {
   return !state.findOpenTradeByPair(profileId, pair);
 }
 
-async function registerSignal(candidate, options = {}) {
+function buildSkippedSignalResult(candidate, reason, extra = {}) {
+  return {
+    ok: false,
+    trade: extra.trade || null,
+    reason,
+    events: [
+      {
+        type: "TRADE_SKIPPED",
+        trade: extra.trade || undefined,
+        candidate,
+        reason,
+        ...extra,
+      },
+    ],
+  };
+}
+
+function getSignalDispatchBudget(profileId) {
+  const runtime = state.getRuntimeSettings(profileId);
+  const activeTrades = loadOpenPositions(profileId).filter((trade) => isTradeOpen(trade));
+  const maxActiveTrades =
+    state.normalizeCapitalMode(runtime.capitalMode) === "COMPOUNDING"
+      ? 1
+      : Math.max(1, Number(runtime.simpleSlots || 1));
+
+  return {
+    profileId,
+    capitalMode: state.normalizeCapitalMode(runtime.capitalMode),
+    activeTradeCount: activeTrades.length,
+    activePairs: uniqueStrings(activeTrades.map((trade) => trade.pair)),
+    maxActiveTrades,
+    freeSlots: Math.max(0, maxActiveTrades - activeTrades.length),
+  };
+}
+
+async function previewSignalRegistration(candidate, options = {}) {
   const profileId = options.profileId || state.DEFAULT_PROFILE_ID;
   const signalKey = getSignalKey(candidate);
   const pair = String(candidate.pair || "").toUpperCase();
@@ -812,30 +847,13 @@ async function registerSignal(candidate, options = {}) {
 
   const existing = state.findOpenTradeByPair(profileId, pair);
   if (existing) {
-    return {
+    return buildSkippedSignalResult(candidate, "pair-already-open", {
       trade: existing,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          trade: existing,
-          candidate,
-          reason: "pair-already-open",
-        },
-      ],
-    };
+    });
   }
 
   if (!runtime.autoTradeEnabled) {
-    return {
-      trade: null,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          candidate,
-          reason: "autotrade-disabled",
-        },
-      ],
-    };
+    return buildSkippedSignalResult(candidate, "autotrade-disabled");
   }
 
   const pairValidation = await pairUniverse.validatePair(pair).catch(() => ({
@@ -843,90 +861,48 @@ async function registerSignal(candidate, options = {}) {
     reason: "invalid-pair",
   }));
   if (!pairValidation.ok) {
-    return {
-      trade: null,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          candidate,
-          reason: pairValidation.reason === "not-listed-on-hyperliquid" ? "not-listed-on-hyperliquid" : "invalid-pair",
-        },
-      ],
-    };
+    return buildSkippedSignalResult(
+      candidate,
+      pairValidation.reason === "not-listed-on-hyperliquid"
+        ? "not-listed-on-hyperliquid"
+        : "invalid-pair"
+    );
   }
 
+  let auth = null;
   if (runtime.executionMode === "REAL") {
     if (!isProfileApprovedForReal(profile)) {
-      return {
-        trade: null,
-        events: [
-          {
-            type: "TRADE_SKIPPED",
-            candidate,
-            reason: "automation-not-approved",
-          },
-        ],
-      };
+      return buildSkippedSignalResult(candidate, "automation-not-approved");
     }
-    const auth = getProfileAuth(profileId);
+    auth = getProfileAuth(profileId);
     if (!hyperliquid.isConfigured(auth)) {
-      return {
-        trade: null,
-        events: [
-          {
-            type: "TRADE_SKIPPED",
-            candidate,
-            reason: "secret-not-configured",
-          },
-        ],
-      };
+      return buildSkippedSignalResult(candidate, "secret-not-configured");
     }
   }
 
   const capitalSnapshot = await buildCapitalSnapshot(profileId, {
     executionMode: runtime.executionMode,
   });
-  if (capitalSnapshot.freeSlots <= 0 || capitalSnapshot.activeTradeCount >= capitalSnapshot.maxActiveTrades) {
-    return {
-      trade: null,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          candidate,
-          reason: "slot-limit-reached",
-        },
-      ],
-    };
+  if (
+    capitalSnapshot.freeSlots <= 0 ||
+    capitalSnapshot.activeTradeCount >= capitalSnapshot.maxActiveTrades
+  ) {
+    return buildSkippedSignalResult(candidate, "slot-limit-reached");
   }
 
   const allocationPlan = buildAllocationPlan(candidate, profileId);
   if (!allocationPlan.accept) {
-    return {
-      trade: null,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          candidate,
-          reason: allocationPlan.reason,
-          cooldownUntil: allocationPlan.cooldownUntil || null,
-        },
-      ],
-    };
+    return buildSkippedSignalResult(candidate, allocationPlan.reason, {
+      cooldownUntil: allocationPlan.cooldownUntil || null,
+    });
   }
 
-  const allMids = await hyperliquid.getAllMids();
-  const marketPrice = Number(allMids?.[pairValidation.coin] || candidate.entryPrice || candidate.entry || 0);
+  const allMids = options.allMids || (await hyperliquid.getAllMids());
+  const marketPrice = Number(
+    allMids?.[pairValidation.coin] || candidate.entryPrice || candidate.entry || 0
+  );
   if (!Number.isFinite(marketPrice) || marketPrice <= 0) {
-    return {
-      trade: null,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          candidate,
-          reason: "missing-market-price",
-        },
-      ],
-    };
+    return buildSkippedSignalResult(candidate, "missing-market-price");
   }
 
   const sizing = buildSizingContext(
@@ -939,31 +915,55 @@ async function registerSignal(candidate, options = {}) {
   );
 
   if (!Number.isFinite(sizing.principalUsed) || sizing.principalUsed <= 0) {
-    return {
-      trade: null,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          candidate,
-          reason: capitalSnapshot.withdrawable <= 0 ? "insufficient-margin" : "insufficient-size",
-        },
-      ],
-    };
+    return buildSkippedSignalResult(
+      candidate,
+      capitalSnapshot.withdrawable <= 0 ? "insufficient-margin" : "insufficient-size"
+    );
   }
 
   if (sizing.quantity <= 0 || sizing.positionNotional < MIN_NOTIONAL_USD) {
+    return buildSkippedSignalResult(candidate, "insufficient-size", {
+      plannedNotional: sizing.positionNotional,
+    });
+  }
+
+  return {
+    ok: true,
+    profileId,
+    profile,
+    runtime,
+    signalKey,
+    pair,
+    side,
+    signalMessageId,
+    pairValidation,
+    capitalSnapshot,
+    allocationPlan,
+    marketPrice,
+    sizing,
+    auth,
+    allMids,
+  };
+}
+
+async function registerSignal(candidate, options = {}) {
+  const prepared = options.prepared || (await previewSignalRegistration(candidate, options));
+  if (!prepared.ok) {
     return {
-      trade: null,
-      events: [
-        {
-          type: "TRADE_SKIPPED",
-          candidate,
-          reason: "insufficient-size",
-          plannedNotional: sizing.positionNotional,
-        },
-      ],
+      trade: prepared.trade || null,
+      events: prepared.events || [],
     };
   }
+
+  const profileId = prepared.profileId;
+  const pair = prepared.pair;
+  const side = prepared.side;
+  const signalMessageId =
+    options.signalMessageId || prepared.signalMessageId || candidate.signalMessageId || null;
+  const runtime = prepared.runtime;
+  const pairValidation = prepared.pairValidation;
+  const sizing = prepared.sizing;
+  const marketPrice = prepared.marketPrice;
 
   const trade = createTrade(candidate, {
     ...sizing,
@@ -983,7 +983,7 @@ async function registerSignal(candidate, options = {}) {
     };
   }
 
-  const auth = getProfileAuth(profileId);
+  const auth = prepared.auth || getProfileAuth(profileId);
 
   try {
     const entryResponse = await hyperliquid.placeEntry(
@@ -1707,5 +1707,7 @@ module.exports = {
   canOpenNewSignal,
   findExistingTrackedSignal,
   findExistingOpen: findExistingTrackedSignal,
+  getSignalDispatchBudget,
+  previewSignalRegistration,
   buildAllocationPlan,
 };

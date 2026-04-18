@@ -1,5 +1,6 @@
 const { buildFeatureSnapshot, round } = require("./indicators");
 const { detectStructure } = require("./structure");
+const MIN_LEARNING_CANDLES = 30;
 
 function getMoveThresholdByTimeframe(timeframe) {
   const map = {
@@ -142,7 +143,7 @@ function detectEventQuality(features, direction) {
 }
 
 function buildPumpEventsForTimeframe(symbol, timeframe, candles, flow) {
-  if (!candles || candles.length < 50) return [];
+  if (!candles || candles.length < MIN_LEARNING_CANDLES) return [];
 
   const events = [];
   const minMove = getMoveThresholdByTimeframe(timeframe);

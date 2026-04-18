@@ -53,6 +53,15 @@ function getActiveScanIntervals() {
   return filtered.length ? filtered : config.supportedKlineIntervals;
 }
 
+function getStrategyLearningIntervals() {
+  const supported = new Set(config.supportedKlineIntervals || []);
+  const configured = Array.isArray(config.strategyLearningIntervals)
+    ? config.strategyLearningIntervals
+    : getActiveScanIntervals();
+  const filtered = configured.filter((timeframe) => supported.has(timeframe));
+  return filtered.length ? filtered : getActiveScanIntervals();
+}
+
 function isRateLimitError(error) {
   return Number(error?.response?.status) === 429 || /\b429\b/.test(String(error?.message || ""));
 }
@@ -242,6 +251,47 @@ async function buildFeatureStoreForPairs(pairs) {
   });
 
   return featureStore;
+}
+
+async function buildLearningStoreForPairs(pairs, liveFeatureStore = {}) {
+  const learningStore = {};
+  const learningIntervals = getStrategyLearningIntervals();
+  let rateLimited = false;
+
+  await mapLimit(
+    pairs,
+    Math.max(1, Math.min(2, Number(config.maxParallelRequests || 2))),
+    async (pair) => {
+      learningStore[pair] = {};
+
+      for (const timeframe of learningIntervals) {
+        if (rateLimited) break;
+
+        try {
+          const candles = await binance.getKlinesForLookback(pair, timeframe, {
+            lookbackMs: config.strategyLearningLookbackMs,
+            maxLookbackMs: config.strategyLearningMaxLookbackMs,
+            minCandles: config.strategyLearningMinCandles,
+          });
+          learningStore[pair][timeframe] = {
+            candles,
+            flow: liveFeatureStore[pair]?.[timeframe]?.flow || {},
+          };
+        } catch (error) {
+          const message = error?.message || String(error);
+          console.error(`Learning payload skipped ${pair} ${timeframe}:`, message);
+          learningStore[pair][timeframe] = null;
+
+          if (isRateLimitError(error)) {
+            rateLimited = true;
+            break;
+          }
+        }
+      }
+    }
+  );
+
+  return learningStore;
 }
 
 function recentEventsOnly(events) {
@@ -439,7 +489,9 @@ async function runScan(options = {}) {
 
     const featureStore = await buildFeatureStoreForPairs(scanPairs);
 
-    let recentLeaders = recentEventsOnly(findRecentPumpLeaders(featureStore));
+    const learningStore = await buildLearningStoreForPairs(scanPairs, featureStore);
+
+    let recentLeaders = recentEventsOnly(findRecentPumpLeaders(learningStore));
     recentLeaders = recentLeaders.map((event) => ({
       ...event,
       regimeSupportScore: extractRegimeSupport(featureStore[event.pair], event.direction),

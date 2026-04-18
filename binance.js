@@ -62,6 +62,10 @@ function candleCacheTtlMs(interval) {
   return Math.max(15_000, Math.min(intervalMs, 15 * 60_000));
 }
 
+function intervalToMs(interval) {
+  return intervalMsMap[normalizeInterval(interval)] || 60_000;
+}
+
 async function waitForRequestSlot(minGapMs = 650) {
   const run = async () => {
     const nowMs = Date.now();
@@ -269,6 +273,48 @@ async function getKlines(symbol, interval, limit = 300, startTime, endTime) {
   return setCacheEntry(cache.candles, cacheKey, mapped, candleCacheTtlMs(normalizedInterval));
 }
 
+async function getKlinesForLookback(
+  symbol,
+  interval,
+  {
+    lookbackMs = config.strategyLearningLookbackMs,
+    maxLookbackMs = config.strategyLearningMaxLookbackMs,
+    minCandles = config.strategyLearningMinCandles,
+    endTime = null,
+  } = {}
+) {
+  const coin = toCoin(symbol);
+  const normalizedInterval = normalizeInterval(interval);
+  const intervalMs = intervalToMs(normalizedInterval);
+  const effectiveEnd = Number(endTime || now());
+  const minimumCandles = Math.max(1, Math.trunc(Number(minCandles || 0)));
+  const requestedLookbackMs = Math.max(
+    Number(lookbackMs || 0),
+    intervalMs * minimumCandles
+  );
+  const boundedLookbackMs = Math.max(
+    intervalMs * minimumCandles,
+    Math.min(Number(maxLookbackMs || requestedLookbackMs), requestedLookbackMs)
+  );
+  const effectiveStart = effectiveEnd - boundedLookbackMs;
+  const cacheKey = `${coin}:${normalizedInterval}:lookback:${effectiveStart}:${effectiveEnd}:${minimumCandles}`;
+  const cached = getCacheEntry(cache.candles, cacheKey);
+  if (cached) return cached;
+
+  const rows = await postInfo({
+    type: "candleSnapshot",
+    req: {
+      coin,
+      interval: normalizedInterval,
+      startTime: effectiveStart,
+      endTime: effectiveEnd,
+    },
+  });
+
+  const mapped = (rows || []).map(mapKline);
+  return setCacheEntry(cache.candles, cacheKey, mapped, candleCacheTtlMs(normalizedInterval));
+}
+
 async function getMarkPrice(symbol) {
   const coin = toCoin(symbol);
   const [ctxMap, mids] = await Promise.all([getAssetCtxMap(), getAllMids()]);
@@ -369,6 +415,7 @@ module.exports = {
   getExchangeInfo,
   getValidUsdtPerpSet,
   getKlines,
+  getKlinesForLookback,
   getMarkPrice,
   getTickerPrice,
   getBookTicker,
