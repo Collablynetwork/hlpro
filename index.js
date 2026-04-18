@@ -97,7 +97,30 @@ function getScanTargets(options = {}) {
   const profiles = state
     .listProfiles({ includeDisabled: false })
     .filter((profile) => profile.status === "ACTIVE" && profile.chatId);
-  if (profiles.length) return profiles;
+  const userProfiles = profiles.filter((profile) => profile.id !== state.DEFAULT_PROFILE_ID);
+  const targetProfiles = userProfiles.length ? userProfiles : profiles;
+
+  if (targetProfiles.length) {
+    const byChat = new Map();
+
+    const priority = (profile) => {
+      let score = 0;
+      if (profile.role === "SYSTEM") score += 100;
+      if (profile.automationStatus === "APPROVED") score += 20;
+      if (profile.automationEnabled) score += 10;
+      return score;
+    };
+
+    for (const profile of targetProfiles) {
+      const key = String(profile.chatId || "");
+      const existing = byChat.get(key);
+      if (!existing || priority(profile) > priority(existing)) {
+        byChat.set(key, profile);
+      }
+    }
+
+    return [...byChat.values()];
+  }
 
   const fallback = state.getProfileById(state.DEFAULT_PROFILE_ID);
   return fallback?.chatId ? [fallback] : [];
