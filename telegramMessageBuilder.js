@@ -63,6 +63,26 @@ function principalInfo(tradeOrContext = {}) {
   return principal != null ? `💼 Principal Used: ${formatUsd(principal)}` : null;
 }
 
+function buildPublicSignalMessage(candidate) {
+  const side = sideWord(candidate.side);
+  const emoji = sideEmoji(side);
+  const pair = String(candidate.pair || "").toUpperCase();
+  const reasons = Array.isArray(candidate.reasons) ? candidate.reasons.slice(0, 4) : [];
+
+  return [
+    `👀 ${side} SIGNAL`,
+    `🪙 Pair: ${pair}`,
+    `🌐 Hyperliquid: ${hyperliquidLink(pair)}`,
+    `⏱ Execution TF: ${candidate.baseTimeframe || candidate.baseTf || "N/A"}`,
+    `💵 Entry: ${formatPrice(candidate.entryPrice || candidate.entry)}`,
+    `🏁 TP: ${formatPrice(candidate.targetPrice || candidate.tp1)}`,
+    `🛑 SL: ${formatPrice(candidate.stopLoss || candidate.sl)}`,
+    `🧠 Strategy: ${candidate.strategyUsed || candidate.strategySource || "N/A"}`,
+    reasons.length ? `✅ Reason: ${reasons.join(" | ")}` : `${emoji} Reason: Matched learned setup`,
+    `Status: SIGNAL CREATED`,
+  ].join("\n");
+}
+
 function buildSignalMessage(candidate, context = {}) {
   const side = sideWord(candidate.side);
   const emoji = sideEmoji(side);
@@ -166,6 +186,36 @@ function buildProtectiveOrdersPlacedMessage(trade) {
     `🏁 TP: ${formatPrice(trade.targetPrice)} | ID: ${trade.tpOrderId || "N/A"}`,
     `🛑 SL: ${formatPrice(trade.stopLoss)} | ID: ${trade.slOrderId || "N/A"}`,
     `TP/SL monitoring is now active.`,
+  ].join("\n");
+}
+
+function buildPublicTargetHitMessage(signal) {
+  return [
+    `🎯 TARGET ACHIEVED`,
+    `🪙 Pair: ${signal.pair}`,
+    `🌐 Hyperliquid: ${hyperliquidLink(signal.pair)}`,
+    `📍 Side: ${signal.side}`,
+    `⏱ Execution TF: ${signal.baseTimeframe || signal.baseTf || "N/A"}`,
+    `💵 Entry: ${formatPrice(signal.entry || signal.entryPrice)}`,
+    `🏁 TP: ${formatPrice(signal.tp || signal.targetPrice)}`,
+    `🛑 SL: ${formatPrice(signal.sl || signal.stopLoss)}`,
+    `🧠 Strategy: ${signal.strategyUsed || signal.strategySource || "N/A"}`,
+    `Status: PUBLIC SIGNAL TARGET HIT`,
+  ].join("\n");
+}
+
+function buildPublicStopHitMessage(signal) {
+  return [
+    `🛑 STOP LOSS HIT`,
+    `🪙 Pair: ${signal.pair}`,
+    `🌐 Hyperliquid: ${hyperliquidLink(signal.pair)}`,
+    `📍 Side: ${signal.side}`,
+    `⏱ Execution TF: ${signal.baseTimeframe || signal.baseTf || "N/A"}`,
+    `💵 Entry: ${formatPrice(signal.entry || signal.entryPrice)}`,
+    `🏁 TP: ${formatPrice(signal.tp || signal.targetPrice)}`,
+    `🛑 SL: ${formatPrice(signal.sl || signal.stopLoss)}`,
+    `🧠 Strategy: ${signal.strategyUsed || signal.strategySource || "N/A"}`,
+    `Status: PUBLIC SIGNAL STOP HIT`,
   ].join("\n");
 }
 
@@ -299,12 +349,15 @@ function buildAutomationDisabledMessage(profile) {
 }
 
 module.exports = {
+  buildPublicSignalMessage,
   buildSignalMessage,
   buildSignalReplyMarkup,
   buildScoreRisingMessage,
   buildOrderPlacedMessage,
   buildEntryFilledMessage,
   buildProtectiveOrdersPlacedMessage,
+  buildPublicTargetHitMessage,
+  buildPublicStopHitMessage,
   buildTargetHitMessage,
   buildStopHitMessage,
   buildTradeSkippedMessage,

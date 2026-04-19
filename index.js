@@ -89,34 +89,26 @@ function getScanTargets(options = {}) {
 
   const profiles = state
     .listProfiles({ includeDisabled: false })
-    .filter((profile) => profile.status === "ACTIVE" && profile.chatId);
+    .filter((profile) => profile.status === "ACTIVE" && profile.walletEnabled !== false);
   const userProfiles = profiles.filter((profile) => profile.id !== state.DEFAULT_PROFILE_ID);
   const targetProfiles = userProfiles.length ? userProfiles : profiles;
 
   if (targetProfiles.length) {
-    const byChat = new Map();
-
-    const priority = (profile) => {
-      let score = 0;
-      if (profile.role === "SYSTEM") score += 100;
-      if (profile.automationStatus === "APPROVED") score += 20;
-      if (profile.automationEnabled) score += 10;
-      return score;
-    };
-
-    for (const profile of targetProfiles) {
-      const key = String(profile.chatId || "");
-      const existing = byChat.get(key);
-      if (!existing || priority(profile) > priority(existing)) {
-        byChat.set(key, profile);
-      }
-    }
-
-    return [...byChat.values()];
+    return targetProfiles;
   }
 
   const fallback = state.getProfileById(state.DEFAULT_PROFILE_ID);
-  return fallback?.chatId ? [fallback] : [];
+  return fallback ? [fallback] : [];
+}
+
+function resolvePublicSignalChatId(options = {}) {
+  const configured = String(config.telegramChatId || "").trim();
+  if (configured) return configured;
+  const fallback = String(options.chatId || "").trim();
+  if (fallback && fallback.startsWith("-")) return fallback;
+  const defaultProfile = state.getProfileById(state.DEFAULT_PROFILE_ID);
+  const defaultChatId = String(defaultProfile?.chatId || "").trim();
+  return defaultChatId && defaultChatId.startsWith("-") ? defaultChatId : null;
 }
 
 function applyUniverseCap(allPairs, watchedPairs) {
@@ -431,6 +423,7 @@ async function runScan(options = {}) {
   try {
     const { targets, watchedPairs, watchedValid, scanPairs } = await resolveScanUniverse(options);
     const scanStartedAt = new Date().toISOString();
+    const publicChatId = resolvePublicSignalChatId(options);
 
     if (!scanPairs.length) {
       const emptySummary = {
@@ -522,16 +515,19 @@ async function runScan(options = {}) {
     });
 
     if (!options.suppressSignals) {
-      for (const target of targets) {
-        const profilePairs = new Set(state.getWatchedPairs(target.id));
-        const filteredCandidates = topCandidates.filter((candidate) => profilePairs.has(candidate.pair));
-        if (!filteredCandidates.length) continue;
-        await signalEngine.dispatchSignals(
-          bot,
-          options.chatId || target.chatId || config.telegramChatId,
-          filteredCandidates,
-          { profileId: target.id }
-        );
+      await signalEngine.syncPublicSignalStatus(bot, { chatId: publicChatId }).catch((error) => {
+        console.error("Public signal sync failed before dispatch:", error.message);
+      });
+
+      const publicDispatch = await signalEngine.dispatchPublicSignal(bot, publicChatId, topCandidates);
+      if (publicDispatch.dispatched && publicDispatch.publicSignal) {
+        for (const target of targets) {
+          const profilePairs = new Set(state.getWatchedPairs(target.id));
+          if (!profilePairs.has(publicDispatch.publicSignal.pair)) continue;
+          await signalEngine.registerSignalForProfile(bot, publicDispatch.publicSignal, {
+            profileId: target.id,
+          });
+        }
       }
     }
 
@@ -597,6 +593,12 @@ async function syncTradeUpdates() {
   tradeSyncLock = true;
 
   try {
+    await signalEngine.syncPublicSignalStatus(bot, {
+      chatId: resolvePublicSignalChatId(),
+    }).catch((error) => {
+      console.error("Public signal sync failed:", error.message);
+    });
+
     const updates = await dryrun.syncTrades();
     if (!updates.length) return [];
 
@@ -609,10 +611,7 @@ async function syncTradeUpdates() {
     }
 
     for (const [profileId, profileUpdates] of grouped.entries()) {
-      const profile = state.getProfileById(profileId) || state.getProfileById(state.DEFAULT_PROFILE_ID);
-      const chatId = profile?.chatId || config.telegramChatId;
-      if (!chatId) continue;
-      await signalEngine.dispatchTradeUpdates(bot, chatId, profileUpdates, { profileId });
+      await signalEngine.dispatchTradeUpdates(bot, null, profileUpdates, { profileId });
     }
 
     return updates;

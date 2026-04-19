@@ -1,13 +1,17 @@
 const config = require("./config");
 const state = require("./state");
 const tradeManager = require("./dryrun");
+const hyperliquid = require("./hyperliquid");
+const pairUniverse = require("./pairUniverse");
 const {
-  buildSignalMessage,
+  buildPublicSignalMessage,
   buildSignalReplyMarkup,
   buildScoreRisingMessage,
   buildOrderPlacedMessage,
   buildEntryFilledMessage,
   buildProtectiveOrdersPlacedMessage,
+  buildPublicTargetHitMessage,
+  buildPublicStopHitMessage,
   buildTargetHitMessage,
   buildStopHitMessage,
   buildTradeSkippedMessage,
@@ -131,22 +135,7 @@ function buildSignalCandidate(matchResult) {
 async function sendNewSignal(bot, chatId, candidate, options = {}) {
   if (!bot || !chatId) return null;
 
-  const runtime = state.getRuntimeSettings(options.profileId || state.DEFAULT_PROFILE_ID);
-  const capitalStatus = await tradeManager.getCapitalStatus(options.profileId || state.DEFAULT_PROFILE_ID).catch(
-    () => null
-  );
-  const capital = capitalStatus?.capitalSnapshot || {};
-  const text = buildSignalMessage(candidate, {
-    capitalMode: runtime.capitalMode,
-    executionMode: runtime.executionMode,
-    leverage: runtime.tradeLeverage,
-    simpleSlots: capital.simpleSlots || runtime.simpleSlots,
-    slotSize: runtime.capitalMode === "SIMPLE" ? capital.slotSize : null,
-    principalUsed:
-      runtime.capitalMode === "SIMPLE"
-        ? capital.slotSize
-        : capital.tradePrincipal || capital.currentPrincipal || runtime.tradeBalanceTarget || runtime.baselinePrincipal || 0,
-  });
+  const text = buildPublicSignalMessage(candidate);
   const replyMarkup = buildSignalReplyMarkup(candidate);
 
   const optionsPayload = {
@@ -215,6 +204,264 @@ function resolveReplyMessageId(update, activeSignals = {}) {
     (entry) => String(entry?.pair || "").toUpperCase() === pair && entry?.messageId
   );
   return fallback?.messageId || null;
+}
+
+function resolvePublicChatId(chatId = null) {
+  const configured = String(config.telegramChatId || "").trim();
+  if (configured) return configured;
+  const fallback = String(chatId || "").trim();
+  return fallback && fallback.startsWith("-") ? fallback : null;
+}
+
+function logPrivateDeliveryIssue(profileId, message, extra = {}) {
+  const payload = {
+    timestamp: state.nowIso(),
+    message,
+    ...extra,
+  };
+  state.setSnapshot(`profile:${profileId}:lastPrivateDeliveryError`, payload);
+  console.warn(message, extra?.error || "");
+}
+
+function isPrivateDeliveryError(error) {
+  return /chat not found|bot was blocked by the user|bot can't initiate conversation|forbidden|user is deactivated/i.test(
+    String(error?.message || "")
+  );
+}
+
+async function sendUserTradeUpdate(bot, profileId, text, options = {}) {
+  if (!bot || !text) return null;
+  const chatId = options.chatId || state.getPrivateChatId(profileId);
+  if (!chatId) {
+    logPrivateDeliveryIssue(
+      profileId,
+      "Cannot send private message to user because user has not started the bot.",
+      { scope: options.scope || "user-trade-update" }
+    );
+    return null;
+  }
+
+  try {
+    return await bot.sendMessage(chatId, text);
+  } catch (error) {
+    if (isPrivateDeliveryError(error)) {
+      logPrivateDeliveryIssue(
+        profileId,
+        "Cannot send private message to user because user has not started the bot.",
+        {
+          scope: options.scope || "user-trade-update",
+          error: error.message,
+        }
+      );
+      return null;
+    }
+    throw error;
+  }
+}
+
+function buildPublicSignalRecord(candidate, publicChatId, messageId) {
+  const signalKey = buildSignalKey(candidate);
+  return {
+    ...candidate,
+    signalId: `${signalKey}:${Date.now()}`,
+    signalKey,
+    signalMessageId: messageId || null,
+    groupChatId: publicChatId,
+    groupMessageId: messageId || null,
+    status: "ACTIVE",
+    createdAt: state.nowIso(),
+    updatedAt: state.nowIso(),
+  };
+}
+
+async function dispatchPublicSignal(bot, chatId, candidates) {
+  const publicChatId = resolvePublicChatId(chatId);
+  const deduped = dedupeCandidates(candidates);
+  if (!bot || !publicChatId || !deduped.length) {
+    return {
+      dispatched: false,
+      reason: deduped.length ? "missing-public-chat" : "no-candidates",
+      publicSignal: state.getPublicSignalState(publicChatId) || null,
+    };
+  }
+
+  const activePublicSignal = state.getPublicSignalState(publicChatId);
+  if (activePublicSignal?.status === "ACTIVE") {
+    return {
+      dispatched: false,
+      reason: "active-public-signal",
+      publicSignal: activePublicSignal,
+    };
+  }
+
+  const candidate = deduped[0];
+  const sent = await sendNewSignal(bot, publicChatId, candidate);
+  const publicSignal = state.setPublicSignalState(
+    publicChatId,
+    buildPublicSignalRecord(candidate, publicChatId, sent?.message_id || null)
+  );
+  state.setSnapshot("system:lastPublicSignal", publicSignal);
+
+  return {
+    dispatched: true,
+    candidate,
+    publicSignal,
+    message: sent,
+  };
+}
+
+async function registerSignalForProfile(bot, publicSignal, options = {}) {
+  const profileId = options.profileId || state.DEFAULT_PROFILE_ID;
+  const candidate = normalizeCandidate(publicSignal);
+  const signalKey = buildSignalKey(candidate);
+  const preview = await tradeManager.previewSignalRegistration(candidate, {
+    profileId,
+    signalMessageId: publicSignal.groupMessageId || publicSignal.signalMessageId || null,
+  });
+
+  if (!preview.ok) {
+    if (preview.events?.length) {
+      await dispatchTradeUpdates(bot, null, preview.events, { profileId });
+    }
+    return {
+      profileId,
+      trade: preview.trade || null,
+      skipped: true,
+      reason: preview.reason || preview.events?.[0]?.reason || "trade-skipped",
+      events: preview.events || [],
+    };
+  }
+
+  const registered = await tradeManager.registerSignal(
+    {
+      ...candidate,
+      signalKey,
+      signalMessageId: publicSignal.groupMessageId || null,
+    },
+    {
+      profileId,
+      signalMessageId: publicSignal.groupMessageId || null,
+      prepared: {
+        ...preview,
+        signalMessageId: publicSignal.groupMessageId || preview.signalMessageId || null,
+      },
+    }
+  );
+  const skipped = registered.events?.some((event) => event.type === "TRADE_SKIPPED");
+
+  if (registered.trade && !skipped) {
+    state.setSnapshot(`profile:${profileId}:lastSignal`, {
+      timestamp: state.nowIso(),
+      pair: candidate.pair,
+      side: candidate.side,
+      baseTimeframe: candidate.baseTimeframe,
+      score: candidate.score,
+      signalKey,
+      publicSignalId: publicSignal.signalId,
+      publicGroupMessageId: publicSignal.groupMessageId || null,
+    });
+    tradeManager.attachSignalMessage(
+      registered.trade.id || registered.trade.signalId,
+      publicSignal.groupMessageId || null,
+      signalKey
+    );
+
+    const activeSignals = state.getActiveSignals(profileId);
+    activeSignals[signalKey] = {
+      ...candidate,
+      groupMessageId: publicSignal.groupMessageId || null,
+      messageId: publicSignal.groupMessageId || null,
+      createdAt: state.nowIso(),
+      updatedAt: state.nowIso(),
+    };
+    state.saveActiveSignals(profileId, activeSignals);
+  }
+
+  if (registered.events?.length) {
+    await dispatchTradeUpdates(bot, null, registered.events, { profileId });
+  }
+
+  return {
+    profileId,
+    trade: registered.trade || null,
+    skipped,
+    reason: skipped
+      ? registered.events?.find((event) => event.type === "TRADE_SKIPPED")?.reason || "trade-skipped"
+      : null,
+    events: registered.events || [],
+  };
+}
+
+async function sendPublicSignalResult(bot, publicSignal, kind) {
+  const publicChatId = resolvePublicChatId(publicSignal?.groupChatId);
+  if (!bot || !publicChatId || !publicSignal) return null;
+
+  const text =
+    kind === "tp" ? buildPublicTargetHitMessage(publicSignal) : buildPublicStopHitMessage(publicSignal);
+  const replyOptions = publicSignal.groupMessageId
+    ? { reply_to_message_id: publicSignal.groupMessageId }
+    : {};
+
+  try {
+    return await bot.sendMessage(publicChatId, text, replyOptions);
+  } catch (error) {
+    if (
+      publicSignal.groupMessageId &&
+      /reply message not found|message to reply not found/i.test(String(error.message || ""))
+    ) {
+      return bot.sendMessage(publicChatId, text);
+    }
+    throw error;
+  }
+}
+
+async function syncPublicSignalStatus(bot, options = {}) {
+  const publicChatId = resolvePublicChatId(options.chatId);
+  if (!bot || !publicChatId) return null;
+
+  const publicSignal = state.getPublicSignalState(publicChatId);
+  if (!publicSignal || publicSignal.status !== "ACTIVE") {
+    return publicSignal;
+  }
+
+  const allMids = options.allMids || (await hyperliquid.getAllMids());
+  const coin = String(publicSignal.coin || pairUniverse.coinFromPair(publicSignal.pair) || "").toUpperCase();
+  const marketPrice = Number(allMids?.[coin] || 0);
+  const targetPrice = Number(publicSignal.tp);
+  const stopPrice = Number(publicSignal.sl);
+  if (!Number.isFinite(marketPrice) || marketPrice <= 0) {
+    return publicSignal;
+  }
+  if (!Number.isFinite(targetPrice) || targetPrice <= 0 || !Number.isFinite(stopPrice) || stopPrice <= 0) {
+    return publicSignal;
+  }
+
+  const hitTarget =
+    publicSignal.side === "LONG"
+      ? marketPrice >= targetPrice
+      : marketPrice <= targetPrice;
+  const hitStop =
+    publicSignal.side === "LONG"
+      ? marketPrice <= stopPrice
+      : marketPrice >= stopPrice;
+
+  if (!hitTarget && !hitStop) {
+    return publicSignal;
+  }
+
+  const outcomeKind = hitTarget ? "tp" : "sl";
+  const resultMessage = await sendPublicSignalResult(bot, publicSignal, outcomeKind);
+  const closed = state.closePublicSignalState(
+    publicChatId,
+    outcomeKind === "tp" ? "TP_HIT" : "SL_HIT",
+    {
+      resultMessageId: resultMessage?.message_id || null,
+      updatedAt: state.nowIso(),
+      closedAt: state.nowIso(),
+    }
+  );
+  state.setSnapshot("system:lastPublicSignal", closed);
+  return closed;
 }
 
 async function dispatchSignals(bot, chatId, candidates, options = {}) {
@@ -363,25 +610,40 @@ function isTerminalEvent(update) {
 
 async function dispatchTradeUpdates(bot, chatId, updates, options = {}) {
   const profileId = options.profileId || state.DEFAULT_PROFILE_ID;
-  if (!bot || !chatId || !Array.isArray(updates) || !updates.length) return [];
+  if (!bot || !Array.isArray(updates) || !updates.length) return [];
 
   const activeSignals = state.getActiveSignals(profileId);
+  const privateChatId = state.getPrivateChatId(profileId);
   const sent = [];
   let dirty = false;
 
+  if (!privateChatId) {
+    logPrivateDeliveryIssue(
+      profileId,
+      "Cannot send private message to user because user has not started the bot.",
+      { scope: "user-trade-update-batch" }
+    );
+  }
+
   for (const update of updates) {
     const trade = update.trade || {};
-    const replyTo = resolveReplyMessageId(update, activeSignals);
     const text = eventMessage(update);
 
     if (!text) continue;
 
-    const message = await bot.sendMessage(
-      chatId,
-      text,
-      replyTo ? { reply_to_message_id: replyTo } : {}
-    );
-    sent.push(message);
+    if (privateChatId) {
+      try {
+        const message = await sendUserTradeUpdate(bot, profileId, text, {
+          scope: update.type || "user-trade-update",
+          chatId: privateChatId,
+        });
+        if (message) {
+          sent.push(message);
+        }
+      } catch (error) {
+        console.error(`Private trade update failed for ${profileId}:`, error.message);
+      }
+    }
 
     const signalKey = trade.signalKey || update.candidate?.signalKey || null;
     if (isTerminalEvent(update)) {
@@ -411,6 +673,9 @@ async function dispatchTradeUpdates(bot, chatId, updates, options = {}) {
 
 module.exports = {
   buildSignalCandidate,
+  dispatchPublicSignal,
+  registerSignalForProfile,
+  syncPublicSignalStatus,
   dispatchSignals,
   dispatchTradeUpdates,
   buildSignalKey,

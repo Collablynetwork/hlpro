@@ -110,6 +110,42 @@ function normalizeAddress(value) {
   return raw || null;
 }
 
+function normalizeChatId(value) {
+  const raw = String(value ?? "").trim();
+  return raw || null;
+}
+
+function looksLikePrivateChatId(chatId) {
+  const normalized = normalizeChatId(chatId);
+  if (!normalized) return false;
+  const numeric = Number(normalized);
+  if (Number.isFinite(numeric)) {
+    return numeric > 0;
+  }
+  return !normalized.startsWith("-");
+}
+
+function isPrivateChat(chat = {}) {
+  const chatType = String(chat?.type || "").trim().toLowerCase();
+  if (chatType) {
+    return chatType === "private";
+  }
+  return looksLikePrivateChatId(chat?.id);
+}
+
+function privateChatSnapshotKey(profileId) {
+  return `profile:${normalizeProfileId(profileId)}:privateChat`;
+}
+
+function publicSignalSnapshotKey(chatId = config.telegramChatId) {
+  return `publicSignal:${normalizeChatId(chatId) || "default"}`;
+}
+
+function numericOrNull(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
 function readLegacyJson(filePath, fallback = null) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -486,6 +522,125 @@ function getSnapshot(key, fallback = null) {
   return parseJsonSafe(row.value_json, fallback);
 }
 
+function setPrivateChatId(profileId, chatId) {
+  const normalizedProfileId = normalizeProfileId(profileId);
+  const normalizedChatId = normalizeChatId(chatId);
+  if (!normalizedChatId) return null;
+
+  setSnapshot(privateChatSnapshotKey(normalizedProfileId), {
+    chatId: normalizedChatId,
+    updatedAt: nowIso(),
+  });
+
+  const profile = getProfileById(normalizedProfileId, { includeSecret: true });
+  if (profile && profile.chatId !== normalizedChatId) {
+    upsertProfile({
+      ...profile,
+      chatId: normalizedChatId,
+    });
+  }
+
+  return normalizedChatId;
+}
+
+function getPrivateChatId(profileId = DEFAULT_PROFILE_ID) {
+  const normalizedProfileId = normalizeProfileId(profileId);
+  const snapshot = getSnapshot(privateChatSnapshotKey(normalizedProfileId), null);
+  const snapshotChatId = normalizeChatId(snapshot?.chatId || snapshot);
+  if (snapshotChatId) return snapshotChatId;
+
+  const profile = getProfileById(normalizedProfileId);
+  const profileChatId = normalizeChatId(profile?.chatId);
+  if (looksLikePrivateChatId(profileChatId)) {
+    return profileChatId;
+  }
+
+  return null;
+}
+
+function normalizePublicSignalState(chatId, signal = {}, previous = null) {
+  const normalizedChatId = normalizeChatId(
+    signal.groupChatId || signal.chatId || previous?.groupChatId || chatId
+  );
+  if (!normalizedChatId) return null;
+
+  const pair = uniqueUpper([signal.pair || previous?.pair || ""])[0] || null;
+  const coin =
+    uniqueUpper([
+      signal.coin ||
+        previous?.coin ||
+        (pair ? String(pair).replace(/USDT$/, "") : ""),
+    ])[0] || null;
+  const side =
+    String(signal.side || previous?.side || "LONG").trim().toUpperCase() === "SHORT"
+      ? "SHORT"
+      : "LONG";
+  const createdAt = signal.createdAt || previous?.createdAt || nowIso();
+  const closedAt = signal.closedAt ?? previous?.closedAt ?? null;
+  const updatedAt = signal.updatedAt || nowIso();
+
+  return {
+    signalId: signal.signalId || previous?.signalId || `${pair || "UNKNOWN"}-${side}-${Date.now()}`,
+    signalKey: signal.signalKey || previous?.signalKey || null,
+    pair,
+    coin,
+    side,
+    entry: numericOrNull(signal.entry ?? signal.entryPrice ?? previous?.entry ?? previous?.entryPrice),
+    tp: numericOrNull(signal.tp ?? signal.targetPrice ?? signal.tp1 ?? previous?.tp ?? previous?.targetPrice),
+    sl: numericOrNull(signal.sl ?? signal.stopLoss ?? previous?.sl ?? previous?.stopLoss),
+    status: String(signal.status || previous?.status || "ACTIVE").trim().toUpperCase(),
+    baseTimeframe:
+      signal.baseTimeframe ||
+      signal.baseTf ||
+      previous?.baseTimeframe ||
+      previous?.baseTf ||
+      null,
+    strategyUsed:
+      signal.strategyUsed ||
+      signal.strategySource ||
+      previous?.strategyUsed ||
+      previous?.strategySource ||
+      null,
+    reasons: Array.isArray(signal.reasons) ? signal.reasons : previous?.reasons || [],
+    groupChatId: normalizedChatId,
+    groupMessageId: numericOrNull(
+      signal.groupMessageId || signal.messageId || previous?.groupMessageId || previous?.messageId
+    ),
+    resultMessageId: numericOrNull(signal.resultMessageId || previous?.resultMessageId),
+    createdAt,
+    closedAt,
+    updatedAt,
+  };
+}
+
+function getPublicSignalState(chatId = config.telegramChatId) {
+  const normalizedChatId = normalizeChatId(chatId);
+  if (!normalizedChatId) return null;
+  const payload = getSnapshot(publicSignalSnapshotKey(normalizedChatId), null);
+  if (!payload) return null;
+  return normalizePublicSignalState(normalizedChatId, payload);
+}
+
+function setPublicSignalState(chatId = config.telegramChatId, signal = {}) {
+  const previous = getPublicSignalState(chatId);
+  const normalized = normalizePublicSignalState(chatId, signal, previous);
+  if (!normalized) return null;
+  setSnapshot(publicSignalSnapshotKey(normalized.groupChatId), normalized);
+  return normalized;
+}
+
+function closePublicSignalState(chatId = config.telegramChatId, status = "CLOSED", updates = {}) {
+  const current = getPublicSignalState(chatId);
+  if (!current) return null;
+  return setPublicSignalState(chatId, {
+    ...current,
+    ...updates,
+    status,
+    closedAt: updates.closedAt || current.closedAt || nowIso(),
+    updatedAt: updates.updatedAt || nowIso(),
+  });
+}
+
 function seedDefaultSettings() {
   if (getSetting(SETTINGS_KEYS.strategyCap) == null) {
     setSetting(SETTINGS_KEYS.strategyCap, Math.max(1, safeInteger(config.strategyCap, 500)));
@@ -686,12 +841,16 @@ function getOrCreateProfileFromTelegram(user = {}, chat = {}) {
   const existing = findProfileByTelegramUserId(telegramUserId, { includeSecret: true });
   const displayName = [user.first_name, user.last_name].filter(Boolean).join(" ").trim() || user.username || `User ${telegramUserId}`;
   const profileId = existing?.id || `tg:${telegramUserId}`;
+  const privateChatId =
+    isPrivateChat(chat)
+      ? normalizeChatId(chat?.id)
+      : getPrivateChatId(profileId) || (looksLikePrivateChatId(existing?.chatId) ? existing.chatId : null);
 
   const profile = upsertProfile({
     ...(existing || {}),
     id: profileId,
     telegramUserId,
-    chatId: chat?.id ? String(chat.id) : existing?.chatId || null,
+    chatId: privateChatId,
     username: user.username || existing?.username || null,
     displayName,
     label: existing?.label || displayName,
@@ -705,6 +864,11 @@ function getOrCreateProfileFromTelegram(user = {}, chat = {}) {
     masterWalletAddress: existing?.masterWalletAddress || null,
     agentWalletAddress: existing?.agentWalletAddress || null,
   });
+
+  if (privateChatId) {
+    setPrivateChatId(profile.id, privateChatId);
+  }
+
   ensureProfileSettings(profile.id);
   if (!getWatchedPairs(profile.id).length) {
     saveWatchedPairs(profile.id, getAllowedPairs());
@@ -1976,6 +2140,11 @@ module.exports = {
   setSetting,
   getSnapshot,
   setSnapshot,
+  getPrivateChatId,
+  setPrivateChatId,
+  getPublicSignalState,
+  setPublicSignalState,
+  closePublicSignalState,
   buildStrategySummary,
   upsertProfile,
   getProfileById,
