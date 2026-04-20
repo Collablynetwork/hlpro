@@ -1,7 +1,6 @@
 const config = require("./config");
 const state = require("./state");
 const binance = require("./binance");
-const pairUniverse = require("./pairUniverse");
 const { buildFeatureSnapshot, round } = require("./indicators");
 const { detectStructure } = require("./structure");
 const { buildDynamicWeights } = require("./weights");
@@ -10,53 +9,26 @@ const {
   learnAndPersist,
   loadStrategies,
   rebuildStrategiesIndexFromFiles,
+  getStrategyRetentionDays,
 } = require("./strategyLearner");
 const { matchStrategiesForPair } = require("./similarity");
 const signalEngine = require("./signals");
 const dryrun = require("./dryrun");
 const telegram = require("./telegram");
-const strategyMaintenance = require("./strategyMaintenance");
 
 state.ensureStorage();
 
-let bot = null;
-let bootstrapPromise = null;
+const bot = telegram.createBot();
 let validSymbolsSet = null;
 let scanLock = false;
-let tradeSyncLock = false;
-
-function ensureBotStarted() {
-  if (bot) return bot;
-
-  bot = telegram.createBot({ polling: config.telegramPolling });
-
-  if (bot) {
-    telegram.registerHandlers(bot, { runScan, syncTradeUpdates });
-  }
-
-  return bot;
-}
 
 function timeframeToFlowPeriod(timeframe) {
   const allowed = new Set(config.supportedFlowPeriods);
   if (allowed.has(timeframe)) return timeframe;
-  if (["1m", "3m"].includes(timeframe)) return "5m";
+  if (["1m"].includes(timeframe)) return "5m";
   if (timeframe === "8h") return "6h";
   if (timeframe === "3d" || timeframe === "1w") return "1d";
   return "1h";
-}
-
-function getActiveScanIntervals() {
-  const supported = new Set(config.supportedKlineIntervals || []);
-  const configured = Array.isArray(config.scanKlineIntervals)
-    ? config.scanKlineIntervals
-    : config.supportedKlineIntervals;
-  const filtered = configured.filter((timeframe) => supported.has(timeframe));
-  return filtered.length ? filtered : config.supportedKlineIntervals;
-}
-
-function isRateLimitError(error) {
-  return Number(error?.response?.status) === 429 || /\b429\b/.test(String(error?.message || ""));
 }
 
 async function mapLimit(items, limit, worker) {
@@ -78,37 +50,7 @@ async function mapLimit(items, limit, worker) {
 }
 
 function uniqueUpper(values) {
-  return [...new Set((values || []).map((value) => String(value).trim().toUpperCase()).filter(Boolean))];
-}
-
-function getScanTargets(options = {}) {
-  if (options.profileId) {
-    const profile = state.getProfileById(options.profileId);
-    return profile ? [profile] : [];
-  }
-
-  const profiles = state
-    .listProfiles({ includeDisabled: false })
-    .filter((profile) => profile.status === "ACTIVE" && profile.walletEnabled !== false);
-  const userProfiles = profiles.filter((profile) => profile.id !== state.DEFAULT_PROFILE_ID);
-  const targetProfiles = userProfiles.length ? userProfiles : profiles;
-
-  if (targetProfiles.length) {
-    return targetProfiles;
-  }
-
-  const fallback = state.getProfileById(state.DEFAULT_PROFILE_ID);
-  return fallback ? [fallback] : [];
-}
-
-function resolvePublicSignalChatId(options = {}) {
-  const configured = String(config.telegramChatId || "").trim();
-  if (configured) return configured;
-  const fallback = String(options.chatId || "").trim();
-  if (fallback && fallback.startsWith("-")) return fallback;
-  const defaultProfile = state.getProfileById(state.DEFAULT_PROFILE_ID);
-  const defaultChatId = String(defaultProfile?.chatId || "").trim();
-  return defaultChatId && defaultChatId.startsWith("-") ? defaultChatId : null;
+  return [...new Set(values.map((v) => String(v).trim().toUpperCase()).filter(Boolean))];
 }
 
 function applyUniverseCap(allPairs, watchedPairs) {
@@ -131,23 +73,17 @@ function applyUniverseCap(allPairs, watchedPairs) {
   return [...priority, ...rest].slice(0, cap);
 }
 
-async function resolveScanUniverse(options = {}) {
-  const targets = getScanTargets(options);
-  const watchedPairs = uniqueUpper(
-    targets.flatMap((profile) => state.getWatchedPairs(profile.id))
-  );
+async function resolveScanUniverse() {
+  const watchedPairs = state.getWatchedPairs();
 
-  if (!validSymbolsSet || options.forceReloadPairs) {
-    validSymbolsSet = await pairUniverse.getTradablePairSet({
-      force: Boolean(options.forceReloadPairs),
-    });
+  if (!validSymbolsSet) {
+    validSymbolsSet = await binance.getValidUsdtPerpSet();
   }
 
   const watchedValid = uniqueUpper(watchedPairs.filter((pair) => validSymbolsSet.has(pair)));
   const finalPairs = applyUniverseCap(watchedValid, watchedValid);
 
   return {
-    targets,
     watchedPairs,
     watchedValid,
     scanPairs: finalPairs,
@@ -234,36 +170,21 @@ async function buildTimeframePayload(symbol, timeframe) {
 
 async function buildFeatureStoreForPairs(pairs) {
   const featureStore = {};
-  const scanIntervals = config.supportedKlineIntervals || [];
-  let rateLimited = false;
 
   await mapLimit(pairs, Number(config.maxParallelRequests || 2), async (pair) => {
     featureStore[pair] = {};
 
-    for (const timeframe of scanIntervals) {
-      if (rateLimited) break;
-
-      try {
-        featureStore[pair][timeframe] = await buildTimeframePayload(pair, timeframe);
-      } catch (error) {
-        const message = error?.message || String(error);
-        console.error(`Timeframe build skipped ${pair} ${timeframe}:`, message);
-        featureStore[pair][timeframe] = null;
-
-        if (isRateLimitError(error)) {
-          rateLimited = true;
-          break;
-        }
-      }
+    for (const timeframe of config.supportedKlineIntervals) {
+      featureStore[pair][timeframe] = await buildTimeframePayload(pair, timeframe);
     }
   });
 
   return featureStore;
 }
 
-function recentEventsOnly(events) {
-  const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
-  return events.filter((event) => new Date(event.timestamp).getTime() >= threeDaysAgo);
+function recentEventsOnly(events, retentionDays = getStrategyRetentionDays()) {
+  const cutoffMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  return events.filter((e) => new Date(e.timestamp).getTime() >= cutoffMs);
 }
 
 function extractRegimeSupport(tfMap, direction) {
@@ -271,17 +192,17 @@ function extractRegimeSupport(tfMap, direction) {
   let score = 0;
 
   for (const tf of regimeTfs) {
-    const features = tfMap?.[tf]?.features;
-    if (!features) continue;
+    const f = tfMap?.[tf]?.features;
+    if (!f) continue;
 
     if (direction === "long") {
-      if (features.trend === "uptrend") score += 0.4;
-      if ((features.rangePositionPct ?? 50) > 55) score += 0.2;
-      if ((features.diSpread ?? 0) > 0) score += 0.2;
+      if (f.trend === "uptrend") score += 0.4;
+      if ((f.rangePositionPct ?? 50) > 55) score += 0.2;
+      if ((f.diSpread ?? 0) > 0) score += 0.2;
     } else {
-      if (features.trend === "downtrend") score += 0.4;
-      if ((features.rangePositionPct ?? 50) < 45) score += 0.2;
-      if ((features.diSpread ?? 0) < 0) score += 0.2;
+      if (f.trend === "downtrend") score += 0.4;
+      if ((f.rangePositionPct ?? 50) < 45) score += 0.2;
+      if ((f.diSpread ?? 0) < 0) score += 0.2;
     }
   }
 
@@ -293,17 +214,17 @@ function buildRegimeSupportDetail(tfMap, direction) {
   const out = {};
 
   for (const tf of regimeTfs) {
-    const features = tfMap?.[tf]?.features || {};
+    const f = tfMap?.[tf]?.features || {};
     out[tf] = {
-      trend: features.trend ?? null,
-      bullishBos: features.bullishBos ?? null,
-      bearishBos: features.bearishBos ?? null,
-      rangePositionPct: features.rangePositionPct ?? null,
-      diSpread: features.diSpread ?? null,
+      trend: f.trend ?? null,
+      bullishBos: f.bullishBos ?? null,
+      bearishBos: f.bearishBos ?? null,
+      rangePositionPct: f.rangePositionPct ?? null,
+      diSpread: f.diSpread ?? null,
       directionSupported:
         direction === "long"
-          ? features.trend === "uptrend" || (features.diSpread ?? 0) > 0
-          : features.trend === "downtrend" || (features.diSpread ?? 0) < 0,
+          ? f.trend === "uptrend" || (f.diSpread ?? 0) > 0
+          : f.trend === "downtrend" || (f.diSpread ?? 0) < 0,
     };
   }
 
@@ -314,38 +235,38 @@ function buildAllTimeframeSnapshot(tfMap) {
   const snapshot = {};
 
   for (const [timeframe, payload] of Object.entries(tfMap || {})) {
-    const features = payload?.features || {};
+    const f = payload?.features || {};
     const flow = payload?.flow || {};
 
     snapshot[timeframe] = {
-      currentClose: features.currentClose ?? null,
-      trend: features.trend ?? null,
-      bullishBos: features.bullishBos ?? null,
-      bearishBos: features.bearishBos ?? null,
-      support: features.support ?? null,
-      resistance: features.resistance ?? null,
-      bbWidthPercentile: features.bbWidthPercentile ?? null,
-      bbWidth: features.bbWidth ?? null,
-      bbBasis: features.bbBasis ?? null,
-      bbUpper: features.bbUpper ?? null,
-      bbLower: features.bbLower ?? null,
-      macdLine: features.macdLine ?? null,
-      macdSignal: features.macdSignal ?? null,
-      macdHistogram: features.macdHistogram ?? null,
-      macdHistogramSlope: features.macdHistogramSlope ?? null,
-      macdBullCross: features.macdBullCross ?? null,
-      macdBearCross: features.macdBearCross ?? null,
-      macdAboveZero: features.macdAboveZero ?? null,
-      macdBelowZero: features.macdBelowZero ?? null,
-      adx: features.adx ?? null,
-      adxSlope: features.adxSlope ?? null,
-      plusDI: features.plusDI ?? null,
-      minusDI: features.minusDI ?? null,
-      diSpread: features.diSpread ?? null,
-      volumeVsAvg20: features.volumeVsAvg20 ?? null,
-      volumeVsAvg50: features.volumeVsAvg50 ?? null,
-      quoteVolumeVsAvg20: features.quoteVolumeVsAvg20 ?? null,
-      rangePositionPct: features.rangePositionPct ?? null,
+      currentClose: f.currentClose ?? null,
+      trend: f.trend ?? null,
+      bullishBos: f.bullishBos ?? null,
+      bearishBos: f.bearishBos ?? null,
+      support: f.support ?? null,
+      resistance: f.resistance ?? null,
+      bbWidthPercentile: f.bbWidthPercentile ?? null,
+      bbWidth: f.bbWidth ?? null,
+      bbBasis: f.bbBasis ?? null,
+      bbUpper: f.bbUpper ?? null,
+      bbLower: f.bbLower ?? null,
+      macdLine: f.macdLine ?? null,
+      macdSignal: f.macdSignal ?? null,
+      macdHistogram: f.macdHistogram ?? null,
+      macdHistogramSlope: f.macdHistogramSlope ?? null,
+      macdBullCross: f.macdBullCross ?? null,
+      macdBearCross: f.macdBearCross ?? null,
+      macdAboveZero: f.macdAboveZero ?? null,
+      macdBelowZero: f.macdBelowZero ?? null,
+      adx: f.adx ?? null,
+      adxSlope: f.adxSlope ?? null,
+      plusDI: f.plusDI ?? null,
+      minusDI: f.minusDI ?? null,
+      diSpread: f.diSpread ?? null,
+      volumeVsAvg20: f.volumeVsAvg20 ?? null,
+      volumeVsAvg50: f.volumeVsAvg50 ?? null,
+      quoteVolumeVsAvg20: f.quoteVolumeVsAvg20 ?? null,
+      rangePositionPct: f.rangePositionPct ?? null,
       openInterest: flow.openInterest ?? null,
       openInterestChangePct: flow.openInterestChangePct ?? null,
       takerBuySellRatio: flow.takerBuySellRatio ?? null,
@@ -362,25 +283,28 @@ function findSupportingTimeframes(tfMap, baseTimeframe, direction) {
   const out = [];
 
   for (const tf of stack) {
-    const features = tfMap?.[tf]?.features;
-    if (!features) continue;
+    const f = tfMap?.[tf]?.features;
+    if (!f) continue;
+
+    if (tf === baseTimeframe) {
+      out.push(tf);
+      continue;
+    }
 
     if (direction === "long") {
       const supported =
-        features.trend === "uptrend" ||
-        features.bullishBos ||
-        (features.diSpread ?? 0) > 0 ||
-        ((features.macdLine ?? 0) >= (features.macdSignal ?? 0) &&
-          (features.macdHistogramSlope ?? 0) >= 0);
+        f.trend === "uptrend" ||
+        f.bullishBos ||
+        (f.diSpread ?? 0) > 0 ||
+        ((f.macdLine ?? 0) >= (f.macdSignal ?? 0) && (f.macdHistogramSlope ?? 0) >= 0);
 
       if (supported) out.push(tf);
     } else {
       const supported =
-        features.trend === "downtrend" ||
-        features.bearishBos ||
-        (features.diSpread ?? 0) < 0 ||
-        ((features.macdLine ?? 0) <= (features.macdSignal ?? 0) &&
-          (features.macdHistogramSlope ?? 0) <= 0);
+        f.trend === "downtrend" ||
+        f.bearishBos ||
+        (f.diSpread ?? 0) < 0 ||
+        ((f.macdLine ?? 0) <= (f.macdSignal ?? 0) && (f.macdHistogramSlope ?? 0) <= 0);
 
       if (supported) out.push(tf);
     }
@@ -403,11 +327,6 @@ function dedupeCandidates(candidates) {
   return [...map.values()].sort((a, b) => b.score - a.score);
 }
 
-async function maybeRunScheduledPrune() {
-  if (!strategyMaintenance.shouldRunScheduledPrune()) return null;
-  return strategyMaintenance.pruneStrategies();
-}
-
 async function runScan(options = {}) {
   if (scanLock) {
     return {
@@ -421,12 +340,10 @@ async function runScan(options = {}) {
   scanLock = true;
 
   try {
-    const { targets, watchedPairs, watchedValid, scanPairs } = await resolveScanUniverse(options);
-    const scanStartedAt = new Date().toISOString();
-    const publicChatId = resolvePublicSignalChatId(options);
+    const { watchedPairs, watchedValid, scanPairs } = await resolveScanUniverse();
 
     if (!scanPairs.length) {
-      const emptySummary = {
+      return {
         skipped: false,
         pairsChecked: 0,
         candidates: 0,
@@ -434,25 +351,13 @@ async function runScan(options = {}) {
         watchedValid: watchedValid.length,
         scannedUniverse: 0,
         topCandidates: [],
-        profiles: targets.length,
       };
-      state.setSnapshot("system:lastScan", {
-        timestamp: scanStartedAt,
-        profileIds: targets.map((profile) => profile.id),
-        summary: emptySummary,
-      });
-      for (const target of targets) {
-        state.setSnapshot(`profile:${target.id}:lastScan`, {
-          timestamp: scanStartedAt,
-          summary: emptySummary,
-        });
-      }
-      return emptySummary;
     }
 
     const featureStore = await buildFeatureStoreForPairs(scanPairs);
 
-    let recentLeaders = recentEventsOnly(findRecentPumpLeaders(featureStore));
+    const retentionDays = getStrategyRetentionDays();
+    let recentLeaders = recentEventsOnly(findRecentPumpLeaders(featureStore), retentionDays);
     recentLeaders = recentLeaders.map((event) => ({
       ...event,
       regimeSupportScore: extractRegimeSupport(featureStore[event.pair], event.direction),
@@ -473,7 +378,7 @@ async function runScan(options = {}) {
     const candidates = [];
 
     for (const pair of scanPairs) {
-      const match = matchStrategiesForPair(pair, featureStore[pair], strategies);
+      const match = matchStrategiesForPair(pair, featureStore[pair], strategies, learnedWeights);
 
       const longSupport = match.long
         ? findSupportingTimeframes(featureStore[pair], match.long.baseTimeframe, "long")
@@ -504,7 +409,9 @@ async function runScan(options = {}) {
       }
     }
 
-    const topCandidates = dedupeCandidates(candidates).slice(0, 25);
+    const preparedSignals = signalEngine.prepareSignalCandidates(candidates);
+    const allCandidates = dedupeCandidates(preparedSignals.validCandidates);
+    const topCandidates = allCandidates.slice(0, 25);
 
     state.writeJson(config.scoreStatePath, {
       generatedAt: new Date().toISOString(),
@@ -512,31 +419,51 @@ async function runScan(options = {}) {
       watchedValid,
       scannedUniverse: scanPairs.length,
       candidates: topCandidates,
+      blockedSignals: preparedSignals.blockedCandidates.slice(0, 25),
     });
 
-    if (!options.suppressSignals) {
-      await signalEngine.syncPublicSignalStatus(bot, { chatId: publicChatId }).catch((error) => {
-        console.error("Public signal sync failed before dispatch:", error.message);
-      });
-
-      const publicDispatch = await signalEngine.dispatchPublicSignal(bot, publicChatId, topCandidates);
-      if (publicDispatch.dispatched && publicDispatch.publicSignal) {
-        for (const target of targets) {
-          const profilePairs = new Set(state.getWatchedPairs(target.id));
-          if (!profilePairs.has(publicDispatch.publicSignal.pair)) continue;
-          await signalEngine.registerSignalForProfile(bot, publicDispatch.publicSignal, {
-            profileId: target.id,
-          });
-        }
-      }
+    const prices = {};
+    for (const pair of scanPairs) {
+      const mark = featureStore[pair]?.["1m"]?.features?.currentClose;
+      if (Number.isFinite(mark)) prices[pair] = mark;
     }
 
-    await syncTradeUpdates();
-    await maybeRunScheduledPrune().catch((error) => {
-      console.error("Scheduled strategy prune failed:", error.message);
-    });
+    const forcedClosures = signalEngine.evaluateInternalMarketClosures(prices, allCandidates);
+    if (forcedClosures.updates.length) {
+      await signalEngine.dispatchTradeUpdates(
+        bot,
+        options.chatId || config.telegramChatId,
+        forcedClosures.updates
+      );
+    }
 
-    const summary = {
+    if (!options.suppressSignals) {
+      const prioritySignalKeys = (forcedClosures.priorityCandidates || []).map((candidate) =>
+        signalEngine.buildSignalKey(candidate)
+      );
+      const dispatchCandidates = [
+        ...(forcedClosures.priorityCandidates || []),
+        ...topCandidates,
+      ];
+
+      await signalEngine.dispatchSignals(
+        bot,
+        options.chatId || config.telegramChatId,
+        dispatchCandidates,
+        { prioritySignalKeys }
+      );
+    }
+
+    const updates = dryrun.evaluateTargetsAndStops(prices);
+    if (updates.length) {
+      await signalEngine.dispatchTradeUpdates(
+        bot,
+        options.chatId || config.telegramChatId,
+        updates
+      );
+    }
+
+    return {
       skipped: false,
       watchedPairs: watchedPairs.length,
       watchedValid: watchedValid.length,
@@ -545,162 +472,59 @@ async function runScan(options = {}) {
       candidates: topCandidates.length,
       learnedStrategies: newStrategies.length,
       topCandidates,
-      profiles: targets.length,
     };
-    state.setSnapshot("system:lastScan", {
-      timestamp: scanStartedAt,
-      profileIds: targets.map((profile) => profile.id),
-      summary,
-    });
-    state.setSnapshot("system:lastScanResult", summary);
-    for (const target of targets) {
-      state.setSnapshot(`profile:${target.id}:lastScan`, {
-        timestamp: scanStartedAt,
-        summary,
-      });
-      state.setSnapshot(`profile:${target.id}:lastScanResult`, summary);
-    }
-    return summary;
   } catch (error) {
     console.error("runScan error:", error);
-    const failure = {
+    return {
       skipped: false,
       pairsChecked: 0,
       candidates: 0,
       topCandidates: [],
       error: error.message,
     };
-    state.setSnapshot("system:lastError", {
-      timestamp: new Date().toISOString(),
-      message: error.message,
-      scope: "runScan",
-    });
-    if (options.profileId) {
-      state.setSnapshot(`profile:${options.profileId}:lastError`, {
-        timestamp: new Date().toISOString(),
-        message: error.message,
-        scope: "runScan",
-      });
-    }
-    return failure;
   } finally {
     scanLock = false;
   }
 }
 
-async function syncTradeUpdates() {
-  if (tradeSyncLock) return [];
-  tradeSyncLock = true;
-
-  try {
-    await signalEngine.syncPublicSignalStatus(bot, {
-      chatId: resolvePublicSignalChatId(),
-    }).catch((error) => {
-      console.error("Public signal sync failed:", error.message);
-    });
-
-    const updates = await dryrun.syncTrades();
-    if (!updates.length) return [];
-
-    const grouped = new Map();
-    for (const update of updates) {
-      const profileId = update.trade?.profileId || update.summary?.profileId || state.DEFAULT_PROFILE_ID;
-      const bucket = grouped.get(profileId) || [];
-      bucket.push(update);
-      grouped.set(profileId, bucket);
-    }
-
-    for (const [profileId, profileUpdates] of grouped.entries()) {
-      await signalEngine.dispatchTradeUpdates(bot, null, profileUpdates, { profileId });
-    }
-
-    return updates;
-  } catch (error) {
-    console.error("syncTradeUpdates error:", error.message);
-    state.setSnapshot("system:lastError", {
-      timestamp: new Date().toISOString(),
-      message: error.message,
-      scope: "syncTradeUpdates",
-    });
-    return [];
-  } finally {
-    tradeSyncLock = false;
-  }
-}
+telegram.registerHandlers(bot, { runScan });
 
 async function bootstrap() {
-  if (bootstrapPromise) return bootstrapPromise;
+  if (typeof rebuildStrategiesIndexFromFiles === "function") {
+    const rebuilt = rebuildStrategiesIndexFromFiles();
+    console.log("Strategy retention cleanup:", {
+      retentionDays: rebuilt.retentionDays,
+      keptStrategies: rebuilt.length,
+      removedStrategies: rebuilt.removedFiles.length,
+    });
+  } else {
+    console.warn("rebuildStrategiesIndexFromFiles export missing, skipping index rebuild.");
+  }
 
-  bootstrapPromise = (async () => {
-    if (typeof rebuildStrategiesIndexFromFiles === "function") {
-      rebuildStrategiesIndexFromFiles();
-    } else {
-      console.warn("rebuildStrategiesIndexFromFiles export missing, skipping index rebuild.");
-    }
-
-    const startedBot = ensureBotStarted();
-
-    if (startedBot && typeof telegram.setupCommands === "function") {
-      await telegram.setupCommands(startedBot);
-      console.log("Telegram command menu registered.");
-    }
-
-    try {
-      await binance.ping();
-      console.log("Connected to Hyperliquid public market data");
-    } catch (error) {
-      console.error("Hyperliquid market-data ping failed:", error.message);
-    }
-
-    try {
-      await pairUniverse.refreshMetadata({ force: true });
-    } catch (error) {
-      console.error("Initial pair metadata refresh failed:", error.message);
-    }
-
-    try {
-      const reconcileSummaries = await dryrun.reconcileAllProfiles();
-      if (reconcileSummaries.length) {
-        console.log("Startup reconciliation summaries:", reconcileSummaries);
-      }
-    } catch (error) {
-      console.error("Startup reconciliation failed:", error.message);
-    }
-
-    const first = await runScan();
-    console.log("Initial scan summary:", first);
-    await syncTradeUpdates();
-
-    setInterval(() => {
-      runScan().then((summary) => {
-        console.log("Scheduled scan summary:", summary);
-      });
-    }, config.scanEveryMs);
-
-    setInterval(() => {
-      syncTradeUpdates().then((updates) => {
-        if (updates.length) {
-          console.log("Trade sync events:", updates.map((event) => event.type));
-        }
-      });
-    }, config.tradeMonitorMs);
-
-    return { ok: true };
-  })();
+  if (bot && typeof telegram.setupCommands === "function") {
+    await telegram.setupCommands(bot);
+    console.log("Telegram command menu registered.");
+  }
 
   try {
-    return await bootstrapPromise;
+    await binance.ping();
+    console.log("Connected to Binance Futures REST");
   } catch (error) {
-    bootstrapPromise = null;
-    throw error;
+    console.error("Binance ping failed:", error.message);
   }
+
+  const first = await runScan();
+  console.log("Initial scan summary:", first);
+
+  setInterval(() => {
+    runScan().then((summary) => {
+      console.log("Scheduled scan summary:", summary);
+    });
+  }, config.scanEveryMs);
 }
 
 if (require.main === module) {
-  bootstrap().catch((error) => {
-    console.error("Bootstrap failed:", error);
-    process.exit(1);
-  });
+  bootstrap();
 }
 
 module.exports = {
@@ -708,5 +532,4 @@ module.exports = {
   bootstrap,
   resolveScanUniverse,
   findSupportingTimeframes,
-  syncTradeUpdates,
 };

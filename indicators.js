@@ -35,6 +35,36 @@ function ema(values, period) {
   return result;
 }
 
+function rsi(values, period = 14) {
+  if (!values.length || values.length < period + 1) return [];
+
+  const result = Array(values.length).fill(null);
+  let gainSum = 0;
+  let lossSum = 0;
+
+  for (let i = 1; i <= period; i += 1) {
+    const change = values[i] - values[i - 1];
+    if (change >= 0) gainSum += change;
+    else lossSum += Math.abs(change);
+  }
+
+  let avgGain = gainSum / period;
+  let avgLoss = lossSum / period;
+  result[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + (avgGain / avgLoss)));
+
+  for (let i = period + 1; i < values.length; i += 1) {
+    const change = values[i] - values[i - 1];
+    const gain = change > 0 ? change : 0;
+    const loss = change < 0 ? Math.abs(change) : 0;
+
+    avgGain = ((avgGain * (period - 1)) + gain) / period;
+    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
+    result[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + (avgGain / avgLoss)));
+  }
+
+  return result;
+}
+
 function stddev(values, period) {
   if (!values.length || values.length < period) return [];
   const result = [];
@@ -172,6 +202,7 @@ function buildFeatureSnapshot(candles) {
   const qVols = quoteVolumeSeries(candles);
   const bb = bollingerBands(closes, 20, 2);
   const macdPack = macd(closes);
+  const rsiPack = rsi(closes, 14);
   const atrPack = atr(candles, 14);
   const adxPack = adx(candles, 14);
   const volAvg20 = sma(vols, 20);
@@ -188,6 +219,8 @@ function buildFeatureSnapshot(candles) {
   const macdLine = latest(macdPack.line);
   const macdSignal = latest(macdPack.signal);
   const macdHist = latest(macdPack.histogram);
+  const rsi14 = latest(rsiPack);
+  const prevRsi14 = latest(rsiPack, 1) ?? rsi14;
   const prevHist = latest(macdPack.histogram, 1) ?? macdHist;
   const prevLine = latest(macdPack.line, 1) ?? macdLine;
   const prevSignal = latest(macdPack.signal, 1) ?? macdSignal;
@@ -198,8 +231,14 @@ function buildFeatureSnapshot(candles) {
   const bbUpper = latest(bb.upper);
   const bbLower = latest(bb.lower);
   const bbWidth = latest(bb.width);
-  const body = candles.length ? Math.abs(candles[candles.length - 1].close - candles[candles.length - 1].open) : 0;
-  const candleRange = candles.length ? candles[candles.length - 1].high - candles[candles.length - 1].low : 0;
+  const lastCandle = candles.length ? candles[candles.length - 1] : null;
+  const body = lastCandle ? Math.abs(lastCandle.close - lastCandle.open) : 0;
+  const candleRange = lastCandle ? lastCandle.high - lastCandle.low : 0;
+  const upperWick = lastCandle ? lastCandle.high - Math.max(lastCandle.open, lastCandle.close) : 0;
+  const lowerWick = lastCandle ? Math.min(lastCandle.open, lastCandle.close) - lastCandle.low : 0;
+  const candleDirection = lastCandle
+    ? (lastCandle.close > lastCandle.open ? "bullish" : (lastCandle.close < lastCandle.open ? "bearish" : "neutral"))
+    : "neutral";
 
   return {
     currentClose: round(currentClose, 8),
@@ -224,10 +263,14 @@ function buildFeatureSnapshot(candles) {
     bbWidthPercentile: round(bbWidthPercentile, 4),
     closeToBbUpperPct: bbUpper ? round((currentClose / bbUpper) * 100, 4) : null,
     closeToBbLowerPct: bbLower ? round((currentClose / bbLower) * 100, 4) : null,
+    distanceFromBbUpperPct: bbUpper && currentClose ? round(((bbUpper - currentClose) / currentClose) * 100, 4) : null,
+    distanceFromBbLowerPct: bbLower && currentClose ? round(((currentClose - bbLower) / currentClose) * 100, 4) : null,
     macdLine: round(macdLine, 8),
     macdSignal: round(macdSignal, 8),
     macdHistogram: round(macdHist, 8),
     macdHistogramSlope: round(macdHist - prevHist, 8),
+    rsi14: round(rsi14, 4),
+    rsiSlope: round((rsi14 ?? 0) - (prevRsi14 ?? 0), 4),
     macdBullCross: Boolean(prevLine <= prevSignal && macdLine > macdSignal),
     macdBearCross: Boolean(prevLine >= prevSignal && macdLine < macdSignal),
     macdAboveZero: Boolean(macdLine > 0 && macdSignal > 0),
@@ -239,6 +282,10 @@ function buildFeatureSnapshot(candles) {
     minusDI: round(minusDI, 4),
     diSpread: round((plusDI ?? 0) - (minusDI ?? 0), 4),
     bodyPctOfRange: candleRange ? round((body / candleRange) * 100, 4) : 0,
+    upperWickPctOfRange: candleRange ? round((upperWick / candleRange) * 100, 4) : 0,
+    lowerWickPctOfRange: candleRange ? round((lowerWick / candleRange) * 100, 4) : 0,
+    candleDirection,
+    currentOpen: round(lastCandle?.open ?? null, 8),
     currentHigh: round(latest(highs), 8),
     currentLow: round(latest(lows), 8)
   };
@@ -251,6 +298,7 @@ module.exports = {
   stddev,
   bollingerBands,
   macd,
+  rsi,
   atr,
   adx,
   roc,

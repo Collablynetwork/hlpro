@@ -1,142 +1,474 @@
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const assert = require("assert");
 
 const projectDir = __dirname;
-const storageDir = path.join(projectDir, "storage");
-if (fs.existsSync(storageDir)) fs.rmSync(storageDir, { recursive: true, force: true });
+const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bnb153-smoke-"));
+const storageDir = path.join(tempRoot, "storage");
+
+const config = require("./config");
+config.storageDir = storageDir;
+config.pairsPath = path.join(storageDir, "pairs.json");
+config.scoreStatePath = path.join(storageDir, "score-state.json");
+config.scoreMomentumStatePath = path.join(storageDir, "score-momentum-state.json");
+config.activeSignalsPath = path.join(storageDir, "active-signals.json");
+config.dryRunPositionsPath = path.join(storageDir, "dryrun-positions.json");
+config.closedTradesPath = path.join(storageDir, "closed-trades.json");
+config.learnedPumpsPath = path.join(storageDir, "learned-pumps.json");
+config.internalSignalHistoryPath = path.join(storageDir, "internal-signal-history.json");
+config.strategySettingsPath = path.join(storageDir, "strategy-settings.json");
+config.strategiesDir = path.join(storageDir, "strategies");
+config.strategiesIndexPath = path.join(config.strategiesDir, "index.json");
+
+process.on("exit", () => {
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+});
 
 const state = require("./state");
 state.ensureStorage();
-
 const signals = require("./signals");
-const tradeManager = require("./dryrun");
-const pairUniverse = require("./pairUniverse");
-const hyperliquid = require("./hyperliquid");
+const dryrun = require("./dryrun");
+const strategyLearner = require("./strategyLearner");
 
-pairUniverse.validatePair = async (pair) => ({
-  ok: true,
-  pair: String(pair).toUpperCase(),
-  coin: String(pair).toUpperCase().replace(/USDT$/, ""),
-  meta: { szDecimals: 3 },
-  link: `https://app.hyperliquid.xyz/trade/${String(pair).toUpperCase().replace(/USDT$/, "")}`,
-});
-hyperliquid.getAllMids = async () => ({ BTC: 100 });
+function makeFeatures(price, side = "LONG", overrides = {}) {
+  const normalizedSide = String(side || "LONG").toUpperCase() === "SHORT" ? "SHORT" : "LONG";
+  const base = {
+    currentClose: price,
+    atr14: Math.max(price * 0.005, 0.5),
+    support: price * 0.998,
+    resistance: price * 1.002,
+    recentHigh20: price * 1.003,
+    recentLow20: price * 0.997,
+    bbUpper: price * 1.003,
+    bbLower: price * 0.997,
+    volumeVsAvg20: 1.5,
+    quoteVolumeVsAvg20: 1.4,
+    bodyPctOfRange: 30,
+    return1: normalizedSide === "SHORT" ? -0.08 : 0.08,
+  };
+
+  if (normalizedSide === "SHORT") {
+    return {
+      ...base,
+      currentHigh: price * 1.004,
+      currentLow: price * 0.996,
+      upperWickPctOfRange: 42,
+      lowerWickPctOfRange: 8,
+      rangePositionPct: 84,
+      macdBearCross: true,
+      macdBullCross: false,
+      macdLine: -0.02,
+      macdSignal: 0.01,
+      macdHistogramSlope: -0.01,
+      rsi14: 62,
+      rsiSlope: -3,
+      candleDirection: "bearish",
+      ...overrides,
+    };
+  }
+
+  return {
+    ...base,
+    currentHigh: price * 1.004,
+    currentLow: price * 0.996,
+    upperWickPctOfRange: 8,
+    lowerWickPctOfRange: 42,
+    rangePositionPct: 16,
+    macdBullCross: true,
+    macdBearCross: false,
+    macdLine: 0.02,
+    macdSignal: -0.01,
+    macdHistogramSlope: 0.01,
+    rsi14: 38,
+    rsiSlope: 3,
+    candleDirection: "bullish",
+    ...overrides,
+  };
+}
 
 function makeMatch(overrides = {}) {
+  const price = Number(overrides.price ?? overrides.current?.features?.currentClose ?? 100);
+  const side = String(overrides.side || overrides.direction || "long").toUpperCase() === "SHORT" ? "SHORT" : "LONG";
+  const features = overrides.current?.features || makeFeatures(price, side);
+
   return {
     pair: "BTCUSDT",
-    side: "LONG",
-    score: 88,
+    direction: "long",
+    score: 86,
     baseTimeframe: "1m",
-    entry: 100,
-    entryPrice: 100,
-    currentPrice: 100,
-    sl: 99.2,
-    tp1: 100.8,
-    tp2: 101.6,
-    tp3: 102.4,
-    supportTimeframes: ["1m", "5m", "15m"],
+    current: {
+      features,
+    },
+    supportTimeframes: ["1m", "3m", "5m"],
     reasons: ["rule A", "rule B"],
     ...overrides,
   };
 }
 
-const profile = state.getProfileById(state.DEFAULT_PROFILE_ID);
+function makeStrategy(pair, eventTime, suffix) {
+  return {
+    id: `${pair}-long-5m-${suffix}`,
+    pair,
+    direction: "long",
+    detectedAt: new Date().toISOString(),
+    eventTime,
+    fileName: `${suffix}_${pair}_5m_bullish_pump.json`,
+    mainSourceTimeframe: "5m",
+    sourceTimeframes: ["5m"],
+    savedTimeframes: ["5m"],
+    supportingTimeframes: ["15m"],
+    resultingExpansionPct: 2.5,
+    fingerprint: {
+      timeframe: "5m",
+      direction: "long",
+      features: {},
+      flow: {},
+      supportingTimeframes: ["15m"],
+    },
+    allTimeframes: {},
+  };
+}
 
-assert(profile, "Default profile should exist");
-assert.deepStrictEqual(
-  state.getWatchedPairs(profile.id),
-  ["BNBUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"].sort()
+function resetSignalRuntime() {
+  dryrun.clearTradeHistory();
+  state.writeJson(config.activeSignalsPath, {});
+  state.writeJson(config.internalSignalHistoryPath, { events: [], lastByPair: {} });
+  state.writeJson(config.scoreMomentumStatePath, {});
+}
+
+function runSignalStep(overrides = {}) {
+  const candidate = signals.buildSignalCandidate(makeMatch(overrides));
+  const prepared = signals.prepareSignalCandidates(candidate ? [candidate] : []);
+
+  return {
+    candidate,
+    valid: prepared.validCandidates[0] || null,
+    blocked: prepared.blockedCandidates[0] || null,
+    prepared,
+  };
+}
+
+function runSignalSequence({ pair, side, baseTimeframe = "1m", price = 100 }, scores) {
+  return scores.map((score) =>
+    runSignalStep({
+      pair,
+      direction: String(side || "LONG").toLowerCase(),
+      score,
+      baseTimeframe,
+      current: {
+        features: makeFeatures(price, side),
+      },
+    })
+  );
+}
+
+function freshSignalCandidate({ pair, side, price = 100, baseTimeframe = "1m" }) {
+  const sequence = runSignalSequence({ pair, side, price, baseTimeframe }, [72, 78, 82]);
+  return sequence[2].valid;
+}
+
+// 1) Candidate strict filtering and adjusted target/stop
+assert.strictEqual(
+  signals.buildSignalCandidate(makeMatch({ baseTimeframe: "15m" })),
+  null,
+  "15m should be rejected"
+);
+assert.strictEqual(
+  signals.buildSignalCandidate(makeMatch({ supportTimeframes: ["1m", "3m"] })),
+  null,
+  "Need 3 support timeframes"
 );
 
-const runtime = state.getRuntimeSettings(profile.id);
-assert.strictEqual(runtime.tradeBalanceTarget, 100);
-assert.strictEqual(runtime.tradeLeverage, 10);
-assert.strictEqual(runtime.capitalMode, "SIMPLE");
-assert.strictEqual(runtime.executionMode, "DEMO");
-assert.strictEqual(runtime.baselinePrincipal, 100);
-assert.strictEqual(runtime.simpleSlots, 1);
-
-state.saveWatchedPairs(profile.id, ["DOGEUSDT"]);
-assert.deepStrictEqual(state.getWatchedPairs(profile.id), ["DOGEUSDT"]);
-
-assert(signals.buildSignalCandidate(makeMatch({ baseTimeframe: "15m" })), "15m should be allowed");
-assert(signals.buildSignalCandidate(makeMatch({ supportTimeframes: ["1m", "5m"] })), "Support count should not hard-block");
-
 const candidate = signals.buildSignalCandidate(makeMatch());
-assert(candidate, "Signal candidate should pass old gate");
-assert.strictEqual(candidate.entryPrice.toFixed(4), "100.0000");
-assert.strictEqual(candidate.tp1.toFixed(4), "100.8000");
-assert.strictEqual(candidate.tp2.toFixed(4), "101.6000");
-assert.strictEqual(candidate.tp3.toFixed(4), "102.4000");
-assert.strictEqual(candidate.stopLoss.toFixed(4), "99.2000");
+assert(candidate, "1m candidate with 3 supports should pass");
+assert.strictEqual(candidate.baseTimeframe, "1m");
+assert.strictEqual(candidate.supportTfs.length, 3);
+assert(candidate.targetPrice < candidate.originalSystemTp1, "Adjusted target should be lower");
+assert(candidate.stopPrice < candidate.originalSystemSl, "Adjusted stop should be lower");
+assert.strictEqual(candidate.tp2, undefined, "TP3 should be removed");
+assert.strictEqual(candidate.tp3, undefined, "TP4 should be removed");
+assert.strictEqual(candidate.ignoredTp3, undefined, "Ignored TP3 should be removed");
+assert.strictEqual(candidate.ignoredTp4, undefined, "Ignored TP4 should be removed");
+assert.strictEqual(candidate.entrySetupValid, true, "LONG bottom rejection setup should pass");
+assert(candidate.entrySetupReasons.some((reason) => reason.includes("support")), "LONG setup should mention support/lower BB");
 
-let allocation = tradeManager.buildAllocationPlan(candidate, profile.id);
-assert.strictEqual(allocation.accept, true);
-assert.strictEqual(allocation.allocationPct, 1);
-
-state.savePairState(profile.id, "BTCUSDT", {
-  pair: "BTCUSDT",
-  lastClosedAt: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
-  lastSide: "LONG",
-  lastEntryPrice: 100,
-  repeatLevel: 0,
-  cooldownUntil: null,
-});
-allocation = tradeManager.buildAllocationPlan({ ...candidate, entryPrice: 101, entry: 101 }, profile.id);
-assert.strictEqual(allocation.accept, true);
-assert.strictEqual(allocation.allocationPct, 0.25);
-assert.strictEqual(allocation.repeatLevel, 1);
-
-tradeManager
-  .registerSignal(candidate, { profileId: profile.id, signalMessageId: 111 })
-  .then((result) => {
-    assert(result.trade, "Demo signal should create a trade");
-    assert.strictEqual(result.trade.executionMode, "DEMO");
-    assert.strictEqual(result.trade.capitalMode, "SIMPLE");
-    assert.strictEqual(result.events.some((event) => event.type === "ENTRY_FILLED"), true);
-
-    const lockState = state.getModeLockState(profile.id);
-    assert.strictEqual(lockState.locked, true);
-
-    const sampleStrategy = {
-      id: "BTCUSDT-long-1m-1",
-      pair: "BTCUSDT",
-      direction: "long",
-      eventTime: new Date().toISOString(),
-      fileName: "sample.json",
-      mainSourceTimeframe: "1m",
-      savedTimeframes: ["1m", "5m"],
-      supportingTimeframes: ["1m", "5m", "15m"],
-      resultingExpansionPct: 12.5,
-      triggerFeatures: {},
-      flowFeatures: {},
-      allTimeframes: {},
-    };
-
-    state.saveStrategy(sampleStrategy);
-    const exported = state.exportStrategiesText();
-    const imported = state.importStrategiesText(exported, { replace: true });
-    assert.strictEqual(imported.strategies.length, 1);
-    assert.strictEqual(imported.strategies[0].id, sampleStrategy.id);
-
-    console.log("All smoke tests passed");
-    console.log(
-      JSON.stringify(
-        {
-          candidate,
-          runtime,
-          allocation,
-          strategies: state.loadStrategiesIndex().length,
-          openTrades: state.listOpenTrades(profile.id).length,
-        },
-        null,
-        2
-      )
-    );
+const invalidLongTop = signals.buildSignalCandidate(
+  makeMatch({
+    score: 82,
+    current: {
+      features: makeFeatures(100, "LONG", {
+        rangePositionPct: 85,
+        currentLow: 99.6,
+        support: 98.5,
+        bbLower: 98.4,
+        lowerWickPctOfRange: 4,
+        volumeVsAvg20: 0.8,
+        quoteVolumeVsAvg20: 0.7,
+      }),
+    },
   })
-  .catch((error) => {
-    console.error(error);
-    process.exit(1);
-  });
+);
+assert.strictEqual(invalidLongTop.entrySetupValid, false, "LONG far from support should fail entry setup");
+
+const validShortTop = signals.buildSignalCandidate(
+  makeMatch({
+    pair: "ETHUSDT",
+    direction: "short",
+    score: 82,
+    current: { features: makeFeatures(200, "SHORT") },
+  })
+);
+assert.strictEqual(validShortTop.entrySetupValid, true, "SHORT top rejection setup should pass");
+
+const chaseShort = signals.buildSignalCandidate(
+  makeMatch({
+    pair: "SOLUSDT",
+    direction: "short",
+    score: 92,
+    current: {
+      features: makeFeatures(150, "SHORT", { return1: -0.8, bodyPctOfRange: 75, candleDirection: "bearish" }),
+    },
+  })
+);
+assert.strictEqual(chaseShort.entrySetupValid, false, "SHORT 90+ after big red candle should be blocked");
+
+// 2) Fresh T0 -> T1 -> T2 sequence and fallback reset behavior
+resetSignalRuntime();
+let sequence = runSignalSequence({ pair: "BTCUSDT", side: "LONG", price: 100 }, [72, 78, 82, 84, 87, 82, 72, 78, 82]);
+assert.strictEqual(sequence[0].valid, null, "T0 should track only");
+assert.strictEqual(sequence[1].valid, null, "T1 should track only");
+assert(sequence[2].valid, "T1 -> T2 should create the first valid signal");
+assert.strictEqual(sequence[2].valid.momentumStatus, "first_signal");
+assert.strictEqual(sequence[2].valid.scoreRange, "T2");
+assert.strictEqual(sequence[2].valid.scoreMove, "T1 → T2");
+assert.strictEqual(sequence[2].valid.momentum, "Fresh Rising");
+assert.strictEqual(sequence[3].valid, null, "Same-range T2 should not signal again");
+assert(sequence[3].blocked, "Same-range T2 should be blocked");
+assert(sequence[4].valid, "T2 -> T3 should be a valid continuation");
+assert.strictEqual(sequence[4].valid.momentumStatus, "continuation");
+assert.strictEqual(sequence[4].valid.scoreMove, "T2 → T3");
+assert.strictEqual(sequence[5].valid, null, "Fallback T3 -> T2 should be blocked");
+assert(sequence[5].blocked.blockedReason.includes("fallback move T3 → T2"), "Fallback should be locked");
+assert.strictEqual(sequence[6].valid, null, "T0 reset should not signal");
+assert.strictEqual(sequence[7].valid, null, "T1 after reset should track only");
+assert(sequence[8].valid, "Fresh T1 -> T2 should work after T0 reset");
+assert.strictEqual(sequence[8].valid.momentumStatus, "first_signal");
+
+// 3) Direct jumps and invalid continuations must stay blocked until reset
+resetSignalRuntime();
+sequence = runSignalSequence({ pair: "ETHUSDT", side: "SHORT", price: 200 }, [72, 82, 87]);
+assert.strictEqual(sequence[0].valid, null, "T0 should track only");
+assert.strictEqual(sequence[1].valid, null, "T0 -> T2 direct jump should be blocked");
+assert(sequence[1].blocked.blockedReason.includes("invalid score jump T0 → T2"), "Direct jump should be logged");
+assert.strictEqual(sequence[2].valid, null, "Continuation after invalid jump should remain blocked");
+assert(sequence[2].blocked.blockedReason.includes("prior fresh buildup was not valid"), "Invalid buildup should stay blocked");
+
+// 4) Internal signal history should record both fresh entries and valid continuations
+resetSignalRuntime();
+sequence = runSignalSequence({ pair: "SOLUSDT", side: "SHORT", price: 150 }, [72, 78, 82]);
+assert(sequence[2].valid, "SOL short fresh signal should be valid");
+signals.evaluateInternalMarketClosures({ SOLUSDT: 150 }, [sequence[2].valid]);
+sequence = runSignalSequence({ pair: "SOLUSDT", side: "SHORT", price: 150 }, [87]);
+assert(sequence[0].valid, "SOL short continuation should be valid");
+signals.evaluateInternalMarketClosures({ SOLUSDT: 149.5 }, [sequence[0].valid]);
+let internalHistory = state.readJson(config.internalSignalHistoryPath, { events: [], lastByPair: {} });
+assert.strictEqual(internalHistory.events.length, 2, "Fresh and continuation events should both be recorded");
+assert.strictEqual(internalHistory.events[1].transitionType, "continuation", "Continuation should stay eligible internally");
+
+// 5) One blocking signal at a time
+resetSignalRuntime();
+const first = dryrun.registerSignal({
+  ...candidate,
+  signalKey: signals.buildSignalKey(candidate),
+  signalMessageId: 111,
+});
+assert(first, "First signal should register");
+assert.strictEqual(dryrun.canOpenNewSignal(), false, "Gate should be blocked after first open");
+assert.strictEqual(dryrun.getBlockingOpenTrades().length, 1, "Blocking trade should be visible");
+
+const blocked = dryrun.registerSignal({
+  ...candidate,
+  pair: "ETHUSDT",
+  signalKey: "ETHUSDT|LONG|1m",
+  signalMessageId: 222,
+});
+assert.strictEqual(blocked, null, "Second signal must be blocked while first is fully open");
+
+// 6) Manual clear should remove blocking trades
+const cleared = dryrun.clearOpenTrades();
+assert.strictEqual(cleared.removedCount, 1, "Manual clear should remove the open trade");
+assert.strictEqual(dryrun.loadOpenPositions().length, 0, "No open trades should remain after manual clear");
+assert.strictEqual(dryrun.canOpenNewSignal(), true, "Gate should open after manual clear");
+
+const reopened = dryrun.registerSignal({
+  ...candidate,
+  signalKey: signals.buildSignalKey(candidate),
+  signalMessageId: 444,
+});
+assert(reopened, "Trade should open again after manual clear");
+
+// 7) Trade closes only on the adjusted target
+let updates = dryrun.evaluateTargetsAndStops({ BTCUSDT: candidate.targetPrice + 0.01 });
+assert(updates.some((u) => u.type === "TARGET ACHIEVED"), "Adjusted target should close the trade");
+let open = dryrun.loadOpenPositions();
+assert.strictEqual(open.length, 0, "Trade should be fully closed after the target");
+assert.strictEqual(dryrun.canOpenNewSignal(), true, "New signal should be allowed after the trade closes");
+
+// 8) New signal can open after the first trade closes
+const secondCandidate = signals.buildSignalCandidate(
+  makeMatch({
+    pair: "ETHUSDT",
+    current: {
+      features: makeFeatures(200, "LONG"),
+    },
+    supportTimeframes: ["1m", "3m", "5m"],
+    score: 87,
+  })
+);
+const second = dryrun.registerSignal({
+  ...secondCandidate,
+  signalKey: signals.buildSignalKey(secondCandidate),
+  signalMessageId: 333,
+});
+assert(second, "Second signal should open after the previous trade closes");
+
+// 9) Stop should close the second trade
+updates = dryrun.evaluateTargetsAndStops({ ETHUSDT: secondCandidate.stopPrice - 0.01 });
+assert(updates.some((u) => u.type === "SL HIT" && u.pair === "ETHUSDT"), "Adjusted stop should close the trade");
+const closed = dryrun.loadClosedTrades();
+assert(
+  closed.some((t) => t.pair === "BTCUSDT" && t.pnlStatus === "TARGET ACHIEVED"),
+  "BTC trade should be fully closed"
+);
+assert(
+  closed.some((t) => t.pair === "ETHUSDT" && t.pnlStatus === "SL HIT"),
+  "ETH trade should be stopped out"
+);
+
+// 10) Stats must track the single active trade model
+const pnl = dryrun.pnlModelSummary();
+assert.strictEqual(pnl.totalSignals, 2, "Trade summary should count all trades");
+assert.strictEqual(pnl.targetCount, 1, "Target count should update");
+assert.strictEqual(pnl.slCount, 1, "Stop count should update");
+
+// 11) Strategy retention should prune old entries and persist configured days
+const now = Date.now();
+strategyLearner.setStrategyRetentionDays(3);
+strategyLearner.saveStrategy(
+  makeStrategy("OLDUSDT", new Date(now - 5 * 24 * 60 * 60 * 1000).toISOString(), "old")
+);
+strategyLearner.saveStrategy(
+  makeStrategy("KEEPUSDT", new Date(now - 24 * 60 * 60 * 1000).toISOString(), "keep")
+);
+
+let rebuilt = strategyLearner.rebuildStrategiesIndexFromFiles();
+assert.strictEqual(rebuilt.length, 1, "Only recent strategy should remain after rebuild");
+assert.strictEqual(rebuilt[0].pair, "KEEPUSDT");
+assert.strictEqual(strategyLearner.getStrategyRetentionDays(), 3, "Retention should default to 3 days");
+
+strategyLearner.saveStrategy(
+  makeStrategy("MIDUSDT", new Date(now - 3 * 24 * 60 * 60 * 1000).toISOString(), "mid")
+);
+const retentionUpdate = strategyLearner.setStrategyRetentionDays(2);
+assert.strictEqual(retentionUpdate.keepRecentDays, 2, "Retention update should persist requested days");
+assert.strictEqual(strategyLearner.getStrategyRetentionDays(), 2, "Retention setting should read back as 2 days");
+assert.strictEqual(retentionUpdate.remainingCount, 1, "Only newest strategy should remain after reducing retention");
+
+// 12) Pair-specific clear should remove only the requested pair
+strategyLearner.saveStrategy(
+  makeStrategy("BTCUSDT", new Date(now - 60 * 60 * 1000).toISOString(), "btc")
+);
+strategyLearner.saveStrategy(
+  makeStrategy("ETHUSDT", new Date(now - 60 * 60 * 1000).toISOString(), "eth")
+);
+const clearPairResult = strategyLearner.clearStrategiesForPair("BTCUSDT");
+assert.strictEqual(clearPairResult.removedCount, 1, "BTC strategy should be removed");
+assert(
+  strategyLearner.loadStrategies().every((item) => item.pair !== "BTCUSDT"),
+  "BTC strategy should no longer exist"
+);
+assert(
+  strategyLearner.loadStrategies().some((item) => item.pair === "ETHUSDT"),
+  "ETH strategy should remain"
+);
+
+// 13) Clear-all should wipe strategies but keep retention configuration
+const clearAllResult = strategyLearner.clearAllStrategies();
+assert(clearAllResult.removedCount >= 1, "Clear-all should remove remaining strategies");
+assert.strictEqual(strategyLearner.loadStrategies().length, 0, "No strategies should remain after clear-all");
+assert.strictEqual(strategyLearner.getStrategyRetentionDays(), 2, "Clear-all should not reset retention days");
+
+// 14) Market reversal should force close only on a valid same-pair reverse plus 2/3 valid internal support
+resetSignalRuntime();
+const openLong = freshSignalCandidate({ pair: "BTCUSDT", side: "LONG", price: 100 });
+assert(openLong, "BTC long fresh signal should be valid");
+const trackedLong = dryrun.registerSignal({
+  ...openLong,
+  signalKey: signals.buildSignalKey(openLong),
+  signalMessageId: 999,
+});
+assert(trackedLong, "Reversal test trade should open");
+
+const ethShort = freshSignalCandidate({ pair: "ETHUSDT", side: "SHORT", price: 200 });
+const solShort = freshSignalCandidate({ pair: "SOLUSDT", side: "SHORT", price: 150 });
+const bnbLong = freshSignalCandidate({ pair: "BNBUSDT", side: "LONG", price: 600 });
+assert(ethShort && solShort && bnbLong, "Supporting internal signals should be valid");
+
+signals.evaluateInternalMarketClosures({ ETHUSDT: 200 }, [ethShort]);
+signals.evaluateInternalMarketClosures({ SOLUSDT: 150 }, [solShort]);
+signals.evaluateInternalMarketClosures({ BNBUSDT: 600 }, [bnbLong]);
+
+const btcShort = freshSignalCandidate({ pair: "BTCUSDT", side: "SHORT", price: 99.7 });
+assert(btcShort, "Same-pair reverse should be a fresh valid signal");
+const reversalResult = signals.evaluateInternalMarketClosures({ BTCUSDT: 99.7 }, [btcShort]);
+assert.strictEqual(reversalResult.updates.length, 1, "Valid reverse plus 2/3 support should force close");
+assert.strictEqual(reversalResult.updates[0].type, "FORCE CLOSED", "Forced close type should be emitted");
+assert.strictEqual(reversalResult.updates[0].reasonCode, "MARKET_REVERSED", "Reversal reason should persist");
+assert.strictEqual(reversalResult.updates[0].position.reverseScoreMove, "T1 → T2", "Reverse score move should be stored");
+assert.strictEqual(
+  reversalResult.priorityCandidates[0].pair,
+  "BTCUSDT",
+  "Fresh same-pair reverse should be prioritized for reopen"
+);
+
+// 15) Invalid same-pair reverse jumps must not force close
+resetSignalRuntime();
+const freshLong = freshSignalCandidate({ pair: "BTCUSDT", side: "LONG", price: 100 });
+const trackedFreshLong = dryrun.registerSignal({
+  ...freshLong,
+  signalKey: signals.buildSignalKey(freshLong),
+  signalMessageId: 1001,
+});
+assert(trackedFreshLong, "Fresh BTC long should open for blocked reversal test");
+
+signals.evaluateInternalMarketClosures({ ETHUSDT: 200 }, [freshSignalCandidate({ pair: "ETHUSDT", side: "SHORT", price: 200 })]);
+signals.evaluateInternalMarketClosures({ SOLUSDT: 150 }, [freshSignalCandidate({ pair: "SOLUSDT", side: "SHORT", price: 150 })]);
+signals.evaluateInternalMarketClosures({ BNBUSDT: 600 }, [freshSignalCandidate({ pair: "BNBUSDT", side: "LONG", price: 600 })]);
+
+sequence = runSignalSequence({ pair: "BTCUSDT", side: "SHORT", price: 99.7 }, [72, 82]);
+assert.strictEqual(sequence[1].valid, null, "T0 -> T2 reverse jump must be invalid");
+assert(sequence[1].blocked.blockedReason.includes("invalid score jump T0 → T2"), "Invalid reverse jump should be blocked");
+const blockedReversal = signals.evaluateInternalMarketClosures({ BTCUSDT: 99.7 }, []);
+assert.strictEqual(blockedReversal.updates.length, 0, "Blocked reverse jump must not force close");
+
+// 16) Clearing trade history should remove open and closed records
+const historyReset = dryrun.clearTradeHistory();
+assert.strictEqual(historyReset.removedTotalCount >= 1, true, "Trade history reset should remove tracked trades");
+assert.strictEqual(dryrun.loadOpenPositions().length, 0, "Open trades should be cleared");
+assert.strictEqual(dryrun.loadClosedTrades().length, 0, "Closed trades should be cleared");
+
+console.log("All smoke tests passed");
+console.log(
+  JSON.stringify(
+    {
+      candidate,
+      pnl,
+      openTrades: dryrun.loadOpenPositions().length,
+      closedTrades: dryrun.loadClosedTrades().length,
+      strategyRetentionDays: strategyLearner.getStrategyRetentionDays(),
+    },
+    null,
+    2
+  )
+);

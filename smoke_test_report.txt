@@ -1,32 +1,24 @@
-Hyperliquid Scanner Rules V2 - Smoke Test Report
-Date: 2026-04-18
+Binance Futures Scanner Top/Bottom Entry Filter - Smoke Test Report
+Date: 2026-04-20
 
 Checks performed:
-1. Syntax validation passed for:
-   - index.js
-   - telegram.js
-   - state.js
-   - dryrun.js
-   - signals.js
-   - telegramMessageBuilder.js
-   - hyperliquid.js
-   - strategyMaintenance.js
+1. Syntax validation passed for all JS files in the updated package.
+2. Logic smoke tests passed for:
+   - strict base timeframe filter: only 1m and 5m
+   - minimum 3 support timeframes including self
+   - score-range momentum sequence: T0 -> T1 -> T2 only for first entry
+   - direct score jump block: T0 -> T2 and T1 -> T3 remain invalid
+   - fallback lock block: T3/T4/T5 returning to T2 remains invalid until T0 reset
+   - LONG bottom entry validation: support/lower BB proximity, lower wick rejection, MACD bullish turn, RSI recovery, and volume/failed breakdown
+   - SHORT top entry validation: resistance/upper BB proximity, upper wick rejection, MACD bearish turn, RSI cooling, and volume/failed breakout
+   - anti-chase block: SHORT 90+ after a big red candle is rejected
+   - adjusted target/stop generation
+   - one blocking signal at a time
+   - force-close market reversal only when same-pair reverse and at least 2/3 other-pair internal reverse signals are valid fresh top/bottom entries
+   - strategy retention and clear commands
 
-2. Logic smoke tests passed in a temporary copied workspace with local stubs for Hyperliquid metadata and mids:
-   - default profile/bootstrap storage creation
-   - default runtime mode seeding (`SIMPLE` + `DEMO`)
-   - dynamic pair storage without `pair.js` runtime filtering
-   - strict base timeframe filter (`1m` / `5m`)
-   - minimum support timeframe filter
-   - repeat allocation logic (100% -> 25%)
-   - demo trade creation and mode-tagged state persistence
-   - mode lock detection with an open trade
-   - strategy export/import round trip
+Result: All smoke tests passed.
 
-3. Verification commands run successfully:
-   - `npm run check`
-   - `node smoke_test.js` in a temp copy
-
-Notes:
-- The smoke test avoids live exchange/network calls by stubbing Hyperliquid pair validation and mids.
-- Live REAL-mode trading, admin approval messaging, and exchange reconciliation still need end-to-end validation in the target runtime environment with real credentials.
+Note:
+- Runtime smoke test uses isolated temporary storage so live bot data is not modified.
+- Live Binance REST calls and real Telegram delivery were not executed in this container.

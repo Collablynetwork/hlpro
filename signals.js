@@ -1,37 +1,54 @@
 const config = require("./config");
 const state = require("./state");
-const tradeManager = require("./dryrun");
-const hyperliquid = require("./hyperliquid");
-const pairUniverse = require("./pairUniverse");
+const dryrun = require("./dryrun");
+const { deleteTelegramMessageLater } = require("./telegramCleanup");
 const {
-  buildPublicSignalMessage,
+  buildSignalMessage,
   buildSignalReplyMarkup,
   buildScoreRisingMessage,
-  buildOrderPlacedMessage,
-  buildEntryFilledMessage,
-  buildProtectiveOrdersPlacedMessage,
-  buildPublicTargetHitMessage,
-  buildPublicStopHitMessage,
   buildTargetHitMessage,
   buildStopHitMessage,
-  buildTradeSkippedMessage,
-  buildOrderRejectedMessage,
-  buildProfitSweptMessage,
-  buildEntryCanceledBeforeFillMessage,
-  buildEntryTimeoutMessage,
-  buildReconciliationCompleteMessage,
+  buildForceClosedMessage,
 } = require("./telegramMessageBuilder");
 
-function getBand(score) {
-  const value = Number(score || 0);
-  if (value >= config.alertThreshold) return "alert";
-  if (value > config.notifyMinScore) return "strong";
-  if (value >= config.watchThreshold) return "watch";
-  return "low";
+const INTERNAL_SIGNAL_HISTORY_DEFAULT = { events: [], lastByPair: {} };
+const INTERNAL_SIGNAL_EVENT_LIMIT = 100;
+const REVERSE_MAJORITY_WINDOW = 3;
+const REVERSE_MAJORITY_MIN = 2;
+
+const SCORE_RANGE_LABELS = {
+  [-1]: "Below 70",
+  0: "T0",
+  1: "T1",
+  2: "T2",
+  3: "T3",
+  4: "T4",
+  5: "T5",
+};
+
+function getScoreRangeIndex(score) {
+  const value = Number(score);
+  if (!Number.isFinite(value)) return null;
+  if (value < 70) return -1;
+  if (value < 75) return 0;
+  if (value < 80) return 1;
+  if (value < 85) return 2;
+  if (value < 90) return 3;
+  if (value < 95) return 4;
+  return 5;
 }
 
-function bandRank(band) {
-  return { low: 0, watch: 1, strong: 2, alert: 3 }[band] ?? 0;
+function getScoreRangeLabel(index) {
+  if (index === null || index === undefined) return "Start";
+  return SCORE_RANGE_LABELS[index] || `T${index}`;
+}
+
+function buildScoreMove(previousIndex, currentIndex) {
+  return `${getScoreRangeLabel(previousIndex)} → ${getScoreRangeLabel(currentIndex)}`;
+}
+
+function uniqueStrings(values) {
+  return [...new Set((values || []).map((v) => String(v).trim()).filter(Boolean))];
 }
 
 function normalizeCandidate(candidate) {
@@ -62,24 +79,277 @@ function buildSignalKey(candidate) {
   ].join("|");
 }
 
-function toNumOrNull(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+function oppositeSide(side) {
+  return String(side || "").toUpperCase() === "SHORT" ? "LONG" : "SHORT";
+}
+
+function adjustSystemValue(value, side, direction) {
+  const base = Number(value || 0);
+  const adjustPct = direction === "target" ? config.systemTargetAdjustPct : config.systemStopAdjustPct;
+  const factor = Number(adjustPct || 0) / 100;
+  const isShort = String(side).toUpperCase() === "SHORT";
+
+  if (!Number.isFinite(base) || base <= 0) return 0;
+  if (isShort) return base * (1 + factor);
+  return base * (1 - factor);
+}
+
+function chooseStopAndTargets(side, entry, currentFeatures = {}) {
+  const atr = Number(currentFeatures.atr14 || 0);
+  const minRisk = Math.max(entry * 0.003, atr * 1.1, entry * 0.0015);
+  const longSupport = Number(currentFeatures.support);
+  const shortResistance = Number(currentFeatures.resistance);
+  let sl;
+
+  if (side === "LONG") {
+    const stopCandidate =
+      Number.isFinite(longSupport) && longSupport > 0 && longSupport < entry
+        ? longSupport
+        : entry - minRisk;
+    sl = Math.min(stopCandidate, entry - Math.max(minRisk * 0.5, entry * 0.001));
+    const risk = Math.max(entry - sl, minRisk);
+    return {
+      systemTp1: entry + risk,
+      systemSl: sl,
+    };
+  }
+
+  const stopCandidate =
+    Number.isFinite(shortResistance) && shortResistance > entry
+      ? shortResistance
+      : entry + minRisk;
+  sl = Math.max(stopCandidate, entry + Math.max(minRisk * 0.5, entry * 0.001));
+  const risk = Math.max(sl - entry, minRisk);
+
+  return {
+    systemTp1: entry - risk,
+    systemSl: sl,
+  };
+}
+
+function finiteFeature(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function pctNear(price, level, tolerancePct) {
+  const p = finiteFeature(price);
+  const l = finiteFeature(level);
+  if (!p || !l || p <= 0 || l <= 0) return false;
+  return Math.abs((p - l) / l) * 100 <= Number(tolerancePct || 0);
+}
+
+function valueAtOrNearUpper(price, level, tolerancePct) {
+  const p = finiteFeature(price);
+  const l = finiteFeature(level);
+  if (!p || !l || p <= 0 || l <= 0) return false;
+  return p >= l * (1 - (Number(tolerancePct || 0) / 100));
+}
+
+function valueAtOrNearLower(price, level, tolerancePct) {
+  const p = finiteFeature(price);
+  const l = finiteFeature(level);
+  if (!p || !l || p <= 0 || l <= 0) return false;
+  return p <= l * (1 + (Number(tolerancePct || 0) / 100));
+}
+
+function isVolumeSpike(features) {
+  const min = Number(config.volumeSpikeMinRatio || 1.2);
+  const vol = finiteFeature(features.volumeVsAvg20);
+  const qVol = finiteFeature(features.quoteVolumeVsAvg20);
+  return (vol !== null && vol >= min) || (qVol !== null && qVol >= min);
+}
+
+function isShortChaseAfterDump(score, features) {
+  const bigMove = Number(config.bigCandleReturnPct || 0.45);
+  const ret1 = finiteFeature(features.return1);
+  const bodyPct = finiteFeature(features.bodyPctOfRange);
+  const candleDirection = String(features.candleDirection || "").toLowerCase();
+  return (
+    Number(score || 0) >= 90 &&
+    ((ret1 !== null && ret1 <= -bigMove) ||
+      (candleDirection === "bearish" && bodyPct !== null && bodyPct >= 60))
+  );
+}
+
+function isLongChaseAfterPump(score, features) {
+  const bigMove = Number(config.bigCandleReturnPct || 0.45);
+  const ret1 = finiteFeature(features.return1);
+  const bodyPct = finiteFeature(features.bodyPctOfRange);
+  const candleDirection = String(features.candleDirection || "").toLowerCase();
+  return (
+    Number(score || 0) >= 90 &&
+    ((ret1 !== null && ret1 >= bigMove) ||
+      (candleDirection === "bullish" && bodyPct !== null && bodyPct >= 60))
+  );
+}
+
+function evaluateTopBottomEntrySetup(side, score, features = {}) {
+  const normalizedSide = String(side || "LONG").toUpperCase() === "SHORT" ? "SHORT" : "LONG";
+  const bandPct = Number(config.entryNearBandPct || 0.35);
+  const levelPct = Number(config.entryNearLevelPct || 0.45);
+  const wickMin = Number(config.rejectionWickMinPct || 28);
+
+  const close = finiteFeature(features.currentClose);
+  const high = finiteFeature(features.currentHigh);
+  const low = finiteFeature(features.currentLow);
+  const support = finiteFeature(features.support ?? features.recentLow20);
+  const resistance = finiteFeature(features.resistance ?? features.recentHigh20);
+  const bbUpper = finiteFeature(features.bbUpper);
+  const bbLower = finiteFeature(features.bbLower);
+  const rangePosition = finiteFeature(features.rangePositionPct);
+  const rsi14 = finiteFeature(features.rsi14);
+  const rsiSlope = finiteFeature(features.rsiSlope);
+  const macdLine = finiteFeature(features.macdLine);
+  const macdSignal = finiteFeature(features.macdSignal);
+  const macdHistogramSlope = finiteFeature(features.macdHistogramSlope);
+  const upperWick = finiteFeature(features.upperWickPctOfRange) ?? 0;
+  const lowerWick = finiteFeature(features.lowerWickPctOfRange) ?? 0;
+
+  const reasons = [];
+  const failures = [];
+  const volumeSpike = isVolumeSpike(features);
+
+  if (normalizedSide === "SHORT") {
+    const nearUpperBb =
+      valueAtOrNearUpper(high ?? close, bbUpper, bandPct) ||
+      pctNear(close, bbUpper, bandPct) ||
+      (rangePosition !== null && rangePosition >= 70);
+    const nearResistance =
+      valueAtOrNearUpper(high ?? close, resistance, levelPct) ||
+      pctNear(close, resistance, levelPct);
+    const priceNearTop = nearUpperBb || nearResistance;
+    const failedBreakout = Boolean(
+      (resistance && high && close && high > resistance && close < resistance) ||
+        (bbUpper && high && close && high > bbUpper && close < bbUpper)
+    );
+    const wickReject = upperWick >= wickMin;
+    const bearishTurn = Boolean(
+      features.macdBearCross === true ||
+        (macdLine !== null && macdSignal !== null && macdLine <= macdSignal) ||
+        (macdHistogramSlope !== null && macdHistogramSlope < 0)
+    );
+    const rsiCooling = Boolean(
+      (rsi14 !== null && rsi14 >= 70) ||
+        (rsi14 !== null && rsi14 >= 55 && rsiSlope !== null && rsiSlope < 0)
+    );
+    const volumeOrFailedBreakout = volumeSpike || failedBreakout;
+
+    if (priceNearTop) reasons.push("price near resistance / upper BB");
+    else failures.push("price is not near resistance / upper BB");
+
+    if (wickReject) reasons.push("upper wick rejection");
+    if (failedBreakout) reasons.push("failed breakout");
+    if (!wickReject && !failedBreakout) failures.push("no upper-wick rejection or failed breakout");
+
+    if (bearishTurn) reasons.push("MACD bearish turn / slowdown");
+    else failures.push("MACD bearish turn not confirmed");
+
+    if (rsiCooling) reasons.push("RSI overbought or cooling down");
+    else failures.push("RSI is not overbought/cooling");
+
+    if (volumeSpike) reasons.push("volume spike");
+    if (!volumeOrFailedBreakout) failures.push("no volume spike or failed breakout");
+
+    if (isShortChaseAfterDump(score, features)) {
+      failures.push("short score is 90+ after a big red candle; avoid chasing dump");
+    }
+
+    return {
+      isValid: failures.length === 0,
+      label: failures.length === 0 ? "SHORT Top Rejection" : "Invalid SHORT Top",
+      reasons,
+      failures,
+    };
+  }
+
+  const nearLowerBb =
+    valueAtOrNearLower(low ?? close, bbLower, bandPct) ||
+    pctNear(close, bbLower, bandPct) ||
+    (rangePosition !== null && rangePosition <= 30);
+  const nearSupport =
+    valueAtOrNearLower(low ?? close, support, levelPct) ||
+    pctNear(close, support, levelPct);
+  const priceNearBottom = nearLowerBb || nearSupport;
+  const failedBreakdown = Boolean(
+    (support && low && close && low < support && close > support) ||
+      (bbLower && low && close && low < bbLower && close > bbLower)
+  );
+  const wickReject = lowerWick >= wickMin;
+  const bullishTurn = Boolean(
+    features.macdBullCross === true ||
+      (macdLine !== null && macdSignal !== null && macdLine >= macdSignal) ||
+      (macdHistogramSlope !== null && macdHistogramSlope > 0)
+  );
+  const rsiRecovering = Boolean(
+    (rsi14 !== null && rsi14 <= 30) ||
+      (rsi14 !== null && rsi14 <= 45 && rsiSlope !== null && rsiSlope > 0)
+  );
+  const volumeOrFailedBreakdown = volumeSpike || failedBreakdown;
+
+  if (priceNearBottom) reasons.push("price near support / lower BB");
+  else failures.push("price is not near support / lower BB");
+
+  if (wickReject) reasons.push("lower wick rejection");
+  if (failedBreakdown) reasons.push("failed breakdown");
+  if (!wickReject && !failedBreakdown) failures.push("no lower-wick rejection or failed breakdown");
+
+  if (bullishTurn) reasons.push("MACD bullish turn / selling slowdown");
+  else failures.push("MACD bullish turn not confirmed");
+
+  if (rsiRecovering) reasons.push("RSI oversold or recovering");
+  else failures.push("RSI is not oversold/recovering");
+
+  if (volumeSpike) reasons.push("volume spike");
+  if (!volumeOrFailedBreakdown) failures.push("no volume spike or failed breakdown");
+
+  if (isLongChaseAfterPump(score, features)) {
+    failures.push("long score is 90+ after a big green candle; avoid chasing pump");
+  }
+
+  return {
+    isValid: failures.length === 0,
+    label: failures.length === 0 ? "LONG Bottom Rejection" : "Invalid LONG Bottom",
+    reasons,
+    failures,
+  };
 }
 
 function buildSignalCandidate(matchResult) {
   if (!matchResult) return null;
-  const score = Number(matchResult.score || 0);
+  const score = Number(matchResult.score);
   if (!Number.isFinite(score)) return null;
 
-  if (!(score > Number(config.notifyAboveScore || config.notifyMinScore || 80))) {
-    return null;
-  }
+  const pair = String(matchResult.pair || "").toUpperCase();
+  if (!pair) return null;
 
   const side =
     String(matchResult.side || matchResult.direction || "LONG").toUpperCase() === "SHORT"
       ? "SHORT"
       : "LONG";
+  const baseTimeframe = matchResult.baseTimeframe || matchResult.baseTf || "N/A";
+  if (!config.allowedBaseTimeframes.includes(baseTimeframe)) return null;
+
+  const currentFeatures = matchResult.current?.features || {};
+  const entry = Number(matchResult.entry ?? matchResult.entryPrice ?? currentFeatures.currentClose ?? 0);
+  if (!Number.isFinite(entry) || entry <= 0) return null;
+
+  const supportTfsRaw =
+    matchResult.supportTfs ||
+    matchResult.supportTimeframes ||
+    matchResult.supportingTimeframes ||
+    matchResult.validationTfs ||
+    [];
+  const supportTfs = uniqueStrings([baseTimeframe, ...supportTfsRaw]);
+  if (supportTfs.length < Number(config.minSupportCount || 3)) return null;
+
+  const generated = chooseStopAndTargets(side, entry, currentFeatures);
+  const originalSystemTp1 = Number(matchResult.tp1 ?? generated.systemTp1);
+  const originalSystemSl = Number(matchResult.sl ?? matchResult.stopLoss ?? generated.systemSl);
+  const targetPrice = adjustSystemValue(originalSystemTp1, side, "target");
+  const stopPrice = adjustSystemValue(originalSystemSl, side, "stop");
+  const riskDistance = Math.abs(entry - stopPrice);
+  const rewardDistance = Math.abs(targetPrice - entry);
   const strategySourcePair =
     matchResult.strategySourcePair || matchResult.sourcePair || matchResult.strategy?.pair || "N/A";
   const strategySourceTimeframe =
@@ -88,80 +358,234 @@ function buildSignalCandidate(matchResult) {
     matchResult.strategy?.mainSourceTimeframe ||
     "N/A";
   const strategyUsed = `${strategySourcePair} ${strategySourceTimeframe}`.trim();
+  const entrySetup = evaluateTopBottomEntrySetup(side, score, currentFeatures);
 
   return {
-    pair: String(matchResult.pair || "").toUpperCase(),
+    pair,
     side,
     direction: side,
     score,
-
-    entry: toNumOrNull(matchResult.entry ?? matchResult.entryPrice),
-    entryPrice: toNumOrNull(matchResult.entry ?? matchResult.entryPrice),
-    currentPrice: toNumOrNull(matchResult.currentPrice),
-
-    sl: toNumOrNull(matchResult.sl ?? matchResult.stopLoss),
-    stopLoss: toNumOrNull(matchResult.sl ?? matchResult.stopLoss),
-
-    tp1: toNumOrNull(matchResult.tp1),
-    tp2: toNumOrNull(matchResult.tp2),
-    tp3: toNumOrNull(matchResult.tp3),
-
-    baseTimeframe: matchResult.baseTimeframe || matchResult.baseTf || "N/A",
-    baseTf: matchResult.baseTimeframe || matchResult.baseTf || "N/A",
-    supportTfs:
-      matchResult.supportTfs ||
-      matchResult.supportingTimeframes ||
-      matchResult.supportTimeframes ||
-      matchResult.validationTfs ||
-      [],
-    supportTimeframes:
-      matchResult.supportTfs ||
-      matchResult.supportingTimeframes ||
-      matchResult.supportTimeframes ||
-      matchResult.validationTfs ||
-      [],
+    entry,
+    entryPrice: entry,
+    currentPrice: Number(matchResult.currentPrice ?? currentFeatures.currentClose ?? entry),
+    targetPrice,
+    stopPrice,
+    tp1: targetPrice,
+    originalSystemTp1,
+    originalSystemSl,
+    sl: stopPrice,
+    stopLoss: stopPrice,
+    baseTimeframe,
+    baseTf: baseTimeframe,
+    supportTfs,
+    supportTimeframes: supportTfs,
     reasons: matchResult.reasons || [],
     strategySourcePair,
     strategySourceTimeframe,
     strategySource: strategyUsed,
     strategyUsed,
     similarityScore: Number(matchResult.similarityScore || score),
-    riskReward: matchResult.riskReward || null,
+    riskReward:
+      Number(matchResult.riskReward) ||
+      (riskDistance > 0 ? Number((rewardDistance / riskDistance).toFixed(4)) : null),
     regimeSupportScore: matchResult.regimeSupportScore ?? null,
-    discoveryType: "watched",
+    entrySetupValid: entrySetup.isValid,
+    entrySetupLabel: entrySetup.label,
+    entrySetupReasons: entrySetup.reasons,
+    entrySetupFailures: entrySetup.failures,
+    entrySetupBlockReason: entrySetup.failures.join("; "),
   };
 }
 
-async function sendNewSignal(bot, chatId, candidate, options = {}) {
-  if (!bot || !chatId) return null;
+function normalizeMomentumSnapshot(snapshot) {
+  const lastObservedRangeIndex = Number(snapshot?.lastObservedRangeIndex);
+  const lastValidRangeIndex = Number(snapshot?.lastValidRangeIndex);
 
-  const text = buildPublicSignalMessage(candidate);
-  const replyMarkup = buildSignalReplyMarkup(candidate);
-
-  const optionsPayload = {
-    disable_web_page_preview: true,
+  return {
+    lastObservedRangeIndex: Number.isFinite(lastObservedRangeIndex) ? lastObservedRangeIndex : null,
+    lastObservedScore: Number.isFinite(Number(snapshot?.lastObservedScore))
+      ? Number(snapshot.lastObservedScore)
+      : null,
+    lastValidRangeIndex: Number.isFinite(lastValidRangeIndex) ? lastValidRangeIndex : null,
+    sequenceLocked: snapshot?.sequenceLocked === true,
+    updatedAt: snapshot?.updatedAt || null,
   };
-  if (replyMarkup) {
-    optionsPayload.reply_markup = replyMarkup;
+}
+
+function defaultMomentumSnapshot() {
+  return normalizeMomentumSnapshot({});
+}
+
+function loadScoreMomentumState() {
+  const raw = state.readJson(config.scoreMomentumStatePath, {}) || {};
+  const normalized = {};
+
+  for (const [key, value] of Object.entries(raw)) {
+    normalized[key] = normalizeMomentumSnapshot(value);
   }
 
-  return bot.sendMessage(chatId, text, optionsPayload);
+  return normalized;
 }
 
-async function sendScoreRise(bot, chatId, previous, current) {
-  if (!bot || !chatId || !previous?.messageId) return null;
+function saveScoreMomentumState(snapshot) {
+  state.writeJson(config.scoreMomentumStatePath, snapshot || {});
+  return snapshot;
+}
 
-  const text = buildScoreRisingMessage({
-    pair: current.pair,
-    baseTf: current.baseTimeframe,
-    oldScore: previous.score,
-    newScore: current.score,
-    updates: current.reasons?.slice(0, 4) || [],
-  });
+function shouldLogBlockedMove(previousIndex, currentIndex) {
+  return (previousIndex ?? -1) >= 2 || currentIndex >= 2;
+}
 
-  return bot.sendMessage(chatId, text, {
-    reply_to_message_id: previous.messageId,
-  });
+function evaluateCandidateMomentum(candidate, previousSnapshot, evaluatedAt = new Date().toISOString()) {
+  const currentRangeIndex = getScoreRangeIndex(candidate.score);
+  const currentRangeLabel = getScoreRangeLabel(currentRangeIndex);
+  const previous = normalizeMomentumSnapshot(previousSnapshot);
+  const previousRangeIndex = previous.lastObservedRangeIndex;
+  const previousRangeLabel = getScoreRangeLabel(previousRangeIndex);
+  const previousValidRangeIndex = previous.lastValidRangeIndex;
+  const scoreMove = buildScoreMove(previousRangeIndex, currentRangeIndex);
+
+  let lastObservedRangeIndex = currentRangeIndex;
+  let lastValidRangeIndex = previousValidRangeIndex;
+  let sequenceLocked = previous.sequenceLocked === true;
+  let transitionType = "tracking";
+  let momentumLabel = "Tracking Only";
+  let validSignalEvent = false;
+  let entryEligible = false;
+  let blockedReason = null;
+
+  if (currentRangeIndex === null) {
+    blockedReason = "score range could not be determined";
+    transitionType = "blocked";
+    momentumLabel = "Invalid Score";
+  } else if (currentRangeIndex < 0) {
+    lastValidRangeIndex = null;
+    sequenceLocked = false;
+    transitionType = "reset";
+    momentumLabel = "Reset Below 70";
+  } else if (currentRangeIndex === 0) {
+    lastValidRangeIndex = 0;
+    sequenceLocked = false;
+    transitionType = "tracking";
+    momentumLabel = "Tracking Reset";
+  } else if (currentRangeIndex === 1) {
+    if (
+      previousRangeIndex !== null &&
+      previousRangeIndex >= 2 &&
+      currentRangeIndex < previousRangeIndex
+    ) {
+      sequenceLocked = true;
+      blockedReason = `fallback move ${scoreMove}; T0 reset required before T2 again`;
+      momentumLabel = "Fallback Locked";
+      transitionType = "blocked";
+    } else if (previousRangeIndex === 0 && previousValidRangeIndex === 0 && !sequenceLocked) {
+      lastValidRangeIndex = 1;
+      transitionType = "tracking";
+      momentumLabel = "Tracking Rising";
+    } else {
+      transitionType = "tracking";
+      momentumLabel = sequenceLocked ? "Tracking Locked" : "Tracking Only";
+    }
+  } else if (previousRangeIndex !== null && currentRangeIndex === previousRangeIndex) {
+    blockedReason = `same-range score move ${scoreMove}`;
+    transitionType = "blocked";
+    momentumLabel = "Same Range";
+  } else if (previousRangeIndex !== null && currentRangeIndex < previousRangeIndex) {
+    if (currentRangeIndex === 0) {
+      lastValidRangeIndex = 0;
+      sequenceLocked = false;
+      transitionType = "reset";
+      momentumLabel = "Tracking Reset";
+    } else {
+      sequenceLocked = true;
+      blockedReason = `fallback move ${scoreMove}; T0 reset required before T2 again`;
+      transitionType = "blocked";
+      momentumLabel = "Fallback Locked";
+    }
+  } else if (previousRangeIndex !== null && currentRangeIndex > previousRangeIndex + 1) {
+    blockedReason = `invalid score jump ${scoreMove}`;
+    transitionType = "blocked";
+    momentumLabel = "Jump Blocked";
+  } else if (sequenceLocked) {
+    blockedReason = `fallback lock active; T0 reset required before ${currentRangeLabel}`;
+    transitionType = "blocked";
+    momentumLabel = "Fallback Locked";
+  } else if (currentRangeIndex === 2) {
+    if (previousRangeIndex === 1 && previousValidRangeIndex === 1) {
+      lastValidRangeIndex = 2;
+      transitionType = "first_signal";
+      momentumLabel = "Fresh Rising";
+      validSignalEvent = true;
+      entryEligible = true;
+    } else if (previousRangeIndex === 1) {
+      blockedReason = `blocked re-entry ${scoreMove}; fresh T0 → T1 → T2 sequence required`;
+      transitionType = "blocked";
+      momentumLabel = "Freshness Blocked";
+    } else {
+      blockedReason = `invalid score jump ${scoreMove}`;
+      transitionType = "blocked";
+      momentumLabel = "Jump Blocked";
+    }
+  } else if (
+    previousRangeIndex === currentRangeIndex - 1 &&
+    previousValidRangeIndex === currentRangeIndex - 1 &&
+    previousValidRangeIndex >= 2
+  ) {
+    lastValidRangeIndex = currentRangeIndex;
+    transitionType = "continuation";
+    momentumLabel = "Step Rising";
+    validSignalEvent = true;
+  } else {
+    blockedReason = `blocked continuation ${scoreMove}; prior fresh buildup was not valid`;
+    transitionType = "blocked";
+    momentumLabel = "Sequence Blocked";
+  }
+
+  const nextSnapshot = {
+    lastObservedRangeIndex,
+    lastObservedScore: Number(candidate.score),
+    lastValidRangeIndex,
+    sequenceLocked,
+    updatedAt: evaluatedAt,
+  };
+
+  return {
+    currentRangeIndex,
+    currentRangeLabel,
+    previousRangeIndex,
+    previousRangeLabel,
+    scoreMove,
+    transitionType,
+    momentumLabel,
+    validSignalEvent,
+    entryEligible,
+    blockedReason,
+    shouldLogBlocked: Boolean(blockedReason && shouldLogBlockedMove(previousRangeIndex, currentRangeIndex)),
+    nextSnapshot,
+  };
+}
+
+function logBlockedCandidate(candidate, evaluation) {
+  if (!evaluation?.shouldLogBlocked) return;
+  console.log(
+    `Blocked ${candidate.pair} ${candidate.side} ${candidate.baseTimeframe}: ${evaluation.blockedReason}.`
+  );
+}
+
+function enrichCandidateWithMomentum(candidate, evaluation) {
+  return {
+    ...candidate,
+    scoreRange: evaluation.currentRangeLabel,
+    scoreRangeIndex: evaluation.currentRangeIndex,
+    previousScoreRange: evaluation.previousRangeLabel,
+    previousScoreRangeIndex: evaluation.previousRangeIndex,
+    scoreMove: evaluation.scoreMove,
+    momentum: evaluation.momentumLabel,
+    momentumStatus: evaluation.transitionType,
+    validSignalEvent: evaluation.validSignalEvent,
+    entryEligible: evaluation.entryEligible,
+    blockedReason: evaluation.blockedReason,
+  };
 }
 
 function dedupeCandidates(candidates) {
@@ -178,494 +602,357 @@ function dedupeCandidates(candidates) {
   return [...byKey.values()].sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
 }
 
-function mergeActiveSignal(previous, candidate, band) {
-  return {
-    ...previous,
-    ...candidate,
-    band: previous?.band || band,
-    updatedAt: new Date().toISOString(),
-  };
-}
+function prioritizeCandidates(candidates, prioritySignalKeys = []) {
+  if (!prioritySignalKeys.length) return candidates;
+  const keys = new Set(prioritySignalKeys);
+  const prioritized = [];
+  const remaining = [];
 
-function resolveReplyMessageId(update, activeSignals = {}) {
-  const trade = update.trade || {};
-  if (trade.signalMessageId || trade.messageId || update.candidate?.signalMessageId) {
-    return trade.signalMessageId || trade.messageId || update.candidate?.signalMessageId || null;
+  for (const candidate of candidates) {
+    if (keys.has(buildSignalKey(candidate))) prioritized.push(candidate);
+    else remaining.push(candidate);
   }
 
-  const signalKey = trade.signalKey || update.candidate?.signalKey || null;
-  if (signalKey && activeSignals[signalKey]?.messageId) {
-    return activeSignals[signalKey].messageId;
-  }
-
-  const pair = String(trade.pair || update.candidate?.pair || "").toUpperCase();
-  if (!pair) return null;
-  const fallback = Object.values(activeSignals).find(
-    (entry) => String(entry?.pair || "").toUpperCase() === pair && entry?.messageId
-  );
-  return fallback?.messageId || null;
+  return [...prioritized, ...remaining];
 }
 
-function resolvePublicChatId(chatId = null) {
-  const configured = String(config.telegramChatId || "").trim();
-  if (configured) return configured;
-  const fallback = String(chatId || "").trim();
-  return fallback && fallback.startsWith("-") ? fallback : null;
-}
+function strongestCandidatePerPair(candidates) {
+  const byPair = new Map();
 
-function logPrivateDeliveryIssue(profileId, message, extra = {}) {
-  const payload = {
-    timestamp: state.nowIso(),
-    message,
-    ...extra,
-  };
-  state.setSnapshot(`profile:${profileId}:lastPrivateDeliveryError`, payload);
-  console.warn(message, extra?.error || "");
-}
-
-function isPrivateDeliveryError(error) {
-  return /chat not found|bot was blocked by the user|bot can't initiate conversation|forbidden|user is deactivated/i.test(
-    String(error?.message || "")
-  );
-}
-
-async function sendUserTradeUpdate(bot, profileId, text, options = {}) {
-  if (!bot || !text) return null;
-  const chatId = options.chatId || state.getPrivateChatId(profileId);
-  if (!chatId) {
-    logPrivateDeliveryIssue(
-      profileId,
-      "Cannot send private message to user because user has not started the bot.",
-      { scope: options.scope || "user-trade-update" }
-    );
-    return null;
-  }
-
-  try {
-    return await bot.sendMessage(chatId, text);
-  } catch (error) {
-    if (isPrivateDeliveryError(error)) {
-      logPrivateDeliveryIssue(
-        profileId,
-        "Cannot send private message to user because user has not started the bot.",
-        {
-          scope: options.scope || "user-trade-update",
-          error: error.message,
-        }
-      );
-      return null;
+  for (const candidate of candidates || []) {
+    const existing = byPair.get(candidate.pair);
+    if (!existing || Number(candidate.score || 0) > Number(existing.score || 0)) {
+      byPair.set(candidate.pair, candidate);
     }
-    throw error;
   }
+
+  return [...byPair.values()];
 }
 
-function buildPublicSignalRecord(candidate, publicChatId, messageId) {
-  const signalKey = buildSignalKey(candidate);
-  return {
-    ...candidate,
-    signalId: `${signalKey}:${Date.now()}`,
-    signalKey,
-    signalMessageId: messageId || null,
-    groupChatId: publicChatId,
-    groupMessageId: messageId || null,
-    status: "ACTIVE",
-    createdAt: state.nowIso(),
-    updatedAt: state.nowIso(),
-  };
-}
-
-async function dispatchPublicSignal(bot, chatId, candidates) {
-  const publicChatId = resolvePublicChatId(chatId);
+function prepareSignalCandidates(candidates, options = {}) {
+  const evaluatedAt = options.evaluatedAt || new Date().toISOString();
+  const momentumState = loadScoreMomentumState();
   const deduped = dedupeCandidates(candidates);
-  if (!bot || !publicChatId || !deduped.length) {
-    return {
-      dispatched: false,
-      reason: deduped.length ? "missing-public-chat" : "no-candidates",
-      publicSignal: state.getPublicSignalState(publicChatId) || null,
-    };
-  }
-
-  const activePublicSignal = state.getPublicSignalState(publicChatId);
-  if (activePublicSignal?.status === "ACTIVE") {
-    return {
-      dispatched: false,
-      reason: "active-public-signal",
-      publicSignal: activePublicSignal,
-    };
-  }
-
-  const candidate = deduped[0];
-  const sent = await sendNewSignal(bot, publicChatId, candidate);
-  const publicSignal = state.setPublicSignalState(
-    publicChatId,
-    buildPublicSignalRecord(candidate, publicChatId, sent?.message_id || null)
-  );
-  state.setSnapshot("system:lastPublicSignal", publicSignal);
-
-  return {
-    dispatched: true,
-    candidate,
-    publicSignal,
-    message: sent,
-  };
-}
-
-async function registerSignalForProfile(bot, publicSignal, options = {}) {
-  const profileId = options.profileId || state.DEFAULT_PROFILE_ID;
-  const candidate = normalizeCandidate(publicSignal);
-  const signalKey = buildSignalKey(candidate);
-  const preview = await tradeManager.previewSignalRegistration(candidate, {
-    profileId,
-    signalMessageId: publicSignal.groupMessageId || publicSignal.signalMessageId || null,
-  });
-
-  if (!preview.ok) {
-    if (preview.events?.length) {
-      await dispatchTradeUpdates(bot, null, preview.events, { profileId });
-    }
-    return {
-      profileId,
-      trade: preview.trade || null,
-      skipped: true,
-      reason: preview.reason || preview.events?.[0]?.reason || "trade-skipped",
-      events: preview.events || [],
-    };
-  }
-
-  const registered = await tradeManager.registerSignal(
-    {
-      ...candidate,
-      signalKey,
-      signalMessageId: publicSignal.groupMessageId || null,
-    },
-    {
-      profileId,
-      signalMessageId: publicSignal.groupMessageId || null,
-      prepared: {
-        ...preview,
-        signalMessageId: publicSignal.groupMessageId || preview.signalMessageId || null,
-      },
-    }
-  );
-  const skipped = registered.events?.some((event) => event.type === "TRADE_SKIPPED");
-
-  if (registered.trade && !skipped) {
-    state.setSnapshot(`profile:${profileId}:lastSignal`, {
-      timestamp: state.nowIso(),
-      pair: candidate.pair,
-      side: candidate.side,
-      baseTimeframe: candidate.baseTimeframe,
-      score: candidate.score,
-      signalKey,
-      publicSignalId: publicSignal.signalId,
-      publicGroupMessageId: publicSignal.groupMessageId || null,
-    });
-    tradeManager.attachSignalMessage(
-      registered.trade.id || registered.trade.signalId,
-      publicSignal.groupMessageId || null,
-      signalKey
-    );
-
-    const activeSignals = state.getActiveSignals(profileId);
-    activeSignals[signalKey] = {
-      ...candidate,
-      groupMessageId: publicSignal.groupMessageId || null,
-      messageId: publicSignal.groupMessageId || null,
-      createdAt: state.nowIso(),
-      updatedAt: state.nowIso(),
-    };
-    state.saveActiveSignals(profileId, activeSignals);
-  }
-
-  if (registered.events?.length) {
-    await dispatchTradeUpdates(bot, null, registered.events, { profileId });
-  }
-
-  return {
-    profileId,
-    trade: registered.trade || null,
-    skipped,
-    reason: skipped
-      ? registered.events?.find((event) => event.type === "TRADE_SKIPPED")?.reason || "trade-skipped"
-      : null,
-    events: registered.events || [],
-  };
-}
-
-async function sendPublicSignalResult(bot, publicSignal, kind) {
-  const publicChatId = resolvePublicChatId(publicSignal?.groupChatId);
-  if (!bot || !publicChatId || !publicSignal) return null;
-
-  const text =
-    kind === "tp" ? buildPublicTargetHitMessage(publicSignal) : buildPublicStopHitMessage(publicSignal);
-  const replyOptions = publicSignal.groupMessageId
-    ? { reply_to_message_id: publicSignal.groupMessageId }
-    : {};
-
-  try {
-    return await bot.sendMessage(publicChatId, text, replyOptions);
-  } catch (error) {
-    if (
-      publicSignal.groupMessageId &&
-      /reply message not found|message to reply not found/i.test(String(error.message || ""))
-    ) {
-      return bot.sendMessage(publicChatId, text);
-    }
-    throw error;
-  }
-}
-
-async function syncPublicSignalStatus(bot, options = {}) {
-  const publicChatId = resolvePublicChatId(options.chatId);
-  if (!bot || !publicChatId) return null;
-
-  const publicSignal = state.getPublicSignalState(publicChatId);
-  if (!publicSignal || publicSignal.status !== "ACTIVE") {
-    return publicSignal;
-  }
-
-  const allMids = options.allMids || (await hyperliquid.getAllMids());
-  const coin = String(publicSignal.coin || pairUniverse.coinFromPair(publicSignal.pair) || "").toUpperCase();
-  const marketPrice = Number(allMids?.[coin] || 0);
-  const targetPrice = Number(publicSignal.tp);
-  const stopPrice = Number(publicSignal.sl);
-  if (!Number.isFinite(marketPrice) || marketPrice <= 0) {
-    return publicSignal;
-  }
-  if (!Number.isFinite(targetPrice) || targetPrice <= 0 || !Number.isFinite(stopPrice) || stopPrice <= 0) {
-    return publicSignal;
-  }
-
-  const hitTarget =
-    publicSignal.side === "LONG"
-      ? marketPrice >= targetPrice
-      : marketPrice <= targetPrice;
-  const hitStop =
-    publicSignal.side === "LONG"
-      ? marketPrice <= stopPrice
-      : marketPrice >= stopPrice;
-
-  if (!hitTarget && !hitStop) {
-    return publicSignal;
-  }
-
-  const outcomeKind = hitTarget ? "tp" : "sl";
-  const resultMessage = await sendPublicSignalResult(bot, publicSignal, outcomeKind);
-  const closed = state.closePublicSignalState(
-    publicChatId,
-    outcomeKind === "tp" ? "TP_HIT" : "SL_HIT",
-    {
-      resultMessageId: resultMessage?.message_id || null,
-      updatedAt: state.nowIso(),
-      closedAt: state.nowIso(),
-    }
-  );
-  state.setSnapshot("system:lastPublicSignal", closed);
-  return closed;
-}
-
-async function dispatchSignals(bot, chatId, candidates, options = {}) {
-  const profileId = options.profileId || state.DEFAULT_PROFILE_ID;
-  const deduped = dedupeCandidates(candidates);
-  if (!deduped.length) return [];
-
-  const activeSignals = state.getActiveSignals(profileId);
-  const signalBudget = tradeManager.getSignalDispatchBudget(profileId);
-  const activePairs = new Set(signalBudget.activePairs || []);
-  const reservedPairs = new Set(signalBudget.activePairs || []);
-  const results = [];
-  let dirty = false;
+  const validCandidates = [];
+  const blockedCandidates = [];
+  const evaluatedCandidates = [];
 
   for (const candidate of deduped) {
     const signalKey = buildSignalKey(candidate);
-    const pair = String(candidate.pair || "").toUpperCase();
-    const band = getBand(candidate.score);
-    const previous = activeSignals[signalKey] || null;
-
-    if (previous && !activePairs.has(pair)) {
-      delete activeSignals[signalKey];
-      dirty = true;
-    }
-
-    if (reservedPairs.has(pair)) {
-      if (previous) {
-        activeSignals[signalKey] = mergeActiveSignal(previous, candidate, band);
-        dirty = true;
-      }
-      results.push({ type: "suppressed", key: signalKey, candidate, reason: "pair-already-open" });
-      continue;
-    }
-
-    const preview = await tradeManager.previewSignalRegistration(candidate, { profileId });
-    if (!preview.ok) {
-      results.push({
-        type: "suppressed",
-        key: signalKey,
-        candidate,
-        reason: preview.reason || preview.events?.[0]?.reason || "trade-skipped",
-      });
-      continue;
-    }
-
-    const sent = await sendNewSignal(bot, chatId, candidate, { profileId });
-    reservedPairs.add(pair);
-
-    const candidateWithMessage = {
-      ...candidate,
-      signalKey,
-      signalMessageId: sent?.message_id || null,
-    };
-    const registered = await tradeManager.registerSignal(candidateWithMessage, {
-      profileId,
-      signalMessageId: sent?.message_id || null,
-      prepared: {
-        ...preview,
-        signalMessageId: sent?.message_id || preview.signalMessageId || null,
+    const evaluation = evaluateCandidateMomentum(candidate, momentumState[signalKey], evaluatedAt);
+    const enriched = enrichCandidateWithMomentum(
+      {
+        ...candidate,
+        signalKey,
       },
-    });
-    const skipped = registered.events?.some((event) => event.type === "TRADE_SKIPPED");
+      evaluation
+    );
 
-    if (registered.trade && !skipped) {
-      state.setSnapshot(`profile:${profileId}:lastSignal`, {
-        timestamp: new Date().toISOString(),
-        pair: candidate.pair,
-        side: candidate.side,
-        baseTimeframe: candidate.baseTimeframe,
-        score: candidate.score,
+    momentumState[signalKey] = evaluation.nextSnapshot;
+    evaluatedCandidates.push(enriched);
+
+    if (evaluation.validSignalEvent) {
+      if (evaluation.entryEligible && enriched.entrySetupValid !== true) {
+        const blocked = {
+          ...enriched,
+          validSignalEvent: false,
+          entryEligible: false,
+          momentumStatus: "entry_setup_blocked",
+          momentum: "Entry Setup Blocked",
+          blockedReason:
+            enriched.entrySetupBlockReason ||
+            `${enriched.side} entry requires fresh T1 → T2 plus top/bottom rejection`,
+        };
+        blockedCandidates.push(blocked);
+        logBlockedCandidate(blocked, {
+          blockedReason: blocked.blockedReason,
+          shouldLogBlocked: true,
+        });
+        continue;
+      }
+
+      validCandidates.push(enriched);
+      continue;
+    }
+
+    if (evaluation.blockedReason) {
+      blockedCandidates.push(enriched);
+      logBlockedCandidate(enriched, evaluation);
+    }
+  }
+
+  saveScoreMomentumState(momentumState);
+
+  return {
+    evaluatedCandidates,
+    validCandidates,
+    blockedCandidates,
+    entryCandidates: validCandidates.filter((candidate) => candidate.entryEligible),
+  };
+}
+
+async function sendNewSignal(bot, chatId, candidate) {
+  if (!bot || !chatId) return null;
+
+  const text = buildSignalMessage(candidate);
+  const replyMarkup = buildSignalReplyMarkup(candidate);
+
+  return bot.sendMessage(chatId, text, {
+    reply_markup: replyMarkup,
+    disable_web_page_preview: true,
+  });
+}
+
+async function sendScoreRise(bot, chatId, previous, current) {
+  if (!bot || !chatId || !previous?.messageId) return null;
+
+  const text = buildScoreRisingMessage({
+    pair: current.pair,
+    baseTf: current.baseTimeframe,
+    oldScore: previous.score,
+    newScore: current.score,
+    scoreRange: current.scoreRange,
+    scoreMove: current.scoreMove,
+    momentum: current.momentum,
+    updates: current.reasons?.slice(0, 4) || [],
+  });
+
+  const message = await bot.sendMessage(chatId, text, {
+    reply_to_message_id: previous.messageId,
+  });
+
+  deleteTelegramMessageLater(bot, chatId, message?.message_id);
+  return message;
+}
+
+function loadInternalSignalHistory() {
+  const raw = state.readJson(config.internalSignalHistoryPath, INTERNAL_SIGNAL_HISTORY_DEFAULT) || {};
+  return {
+    events: Array.isArray(raw.events) ? raw.events : [],
+    lastByPair: raw.lastByPair && typeof raw.lastByPair === "object" ? raw.lastByPair : {},
+  };
+}
+
+function saveInternalSignalHistory(snapshot) {
+  state.writeJson(config.internalSignalHistoryPath, snapshot);
+  return snapshot;
+}
+
+function recordInternalSignalEvents(candidates, recordedAt = new Date().toISOString()) {
+  const history = loadInternalSignalHistory();
+  const strongest = strongestCandidatePerPair(candidates)
+    .filter((candidate) => candidate.validSignalEvent && (candidate.entryEligible !== true || candidate.entrySetupValid === true))
+    .sort((a, b) => Number(a.score || 0) - Number(b.score || 0));
+
+  for (const candidate of strongest) {
+    const pair = String(candidate.pair || "").toUpperCase();
+    const side = String(candidate.side || "").toUpperCase();
+    const event = {
+      pair,
+      side,
+      score: Number(candidate.score || 0),
+      scoreRange: candidate.scoreRange || null,
+      scoreMove: candidate.scoreMove || null,
+      momentum: candidate.momentum || null,
+      transitionType: candidate.momentumStatus || null,
+      entryEligible: candidate.entryEligible === true,
+      entrySetupValid: candidate.entrySetupValid === true,
+      reversalEligible: candidate.entryEligible === true && candidate.entrySetupValid === true,
+      baseTimeframe: candidate.baseTimeframe || null,
+      signalKey: candidate.signalKey || buildSignalKey(candidate),
+      recordedAt,
+    };
+
+    history.lastByPair[pair] = event;
+    history.events.push(event);
+  }
+
+  history.events = history.events.slice(-INTERNAL_SIGNAL_EVENT_LIMIT);
+  return saveInternalSignalHistory(history);
+}
+
+function recentOtherSignalEvents(events, pair, limit) {
+  return (events || [])
+    .filter((event) => event.pair !== String(pair || "").toUpperCase())
+    .slice(-limit);
+}
+
+function buildForcedCloseDetails(position, reverseCandidate, reverseVotes) {
+  return {
+    reasonCode: "MARKET_REVERSED",
+    reasonText:
+      "Same-pair reverse signal plus market-wide reverse confirmation.",
+    forceDirection: reverseCandidate.side,
+    reverseSignalSide: reverseCandidate.side,
+    reverseScoreMove: reverseCandidate.scoreMove,
+    reverseScoreRange: reverseCandidate.scoreRange,
+    samePairReverseValid: true,
+    majorityConfirmationText: `At least ${REVERSE_MAJORITY_MIN}/${REVERSE_MAJORITY_WINDOW} internal reverse signals`,
+  };
+}
+
+function evaluateInternalMarketClosures(priceByPair, candidates) {
+  const history = recordInternalSignalEvents(candidates);
+  const openPositions = dryrun.getBlockingOpenTrades();
+  const updates = [];
+  const priorityCandidates = [];
+
+  for (const position of openPositions) {
+    const reverseSide = oppositeSide(position.side);
+    const reverseCandidate = (candidates || [])
+      .filter(
+        (candidate) =>
+          String(candidate.pair || "").toUpperCase() === position.pair &&
+          String(candidate.side || "").toUpperCase() === reverseSide &&
+          candidate.validSignalEvent &&
+          candidate.entryEligible === true &&
+          candidate.entrySetupValid === true
+      )
+      .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0];
+
+    if (!reverseCandidate) continue;
+
+    const lastThreeOther = recentOtherSignalEvents(history.events, position.pair, REVERSE_MAJORITY_WINDOW);
+    const reverseVotes = lastThreeOther.filter(
+      (event) => event.side === reverseSide && event.reversalEligible === true
+    ).length;
+    const forceClosePrice =
+      Number(priceByPair?.[position.pair]) ||
+      Number(reverseCandidate?.currentPrice) ||
+      Number(position.currentMark) ||
+      Number(position.entryPrice);
+
+    if (
+      lastThreeOther.length === REVERSE_MAJORITY_WINDOW &&
+      reverseVotes >= REVERSE_MAJORITY_MIN
+    ) {
+      const forced = dryrun.forceCloseTrade(
+        position.signalId || position.id || position.signalKey,
+        forceClosePrice,
+        buildForcedCloseDetails(position, reverseCandidate, reverseVotes)
+      );
+
+      if (forced) {
+        updates.push(forced);
+        if (reverseCandidate.entryEligible) priorityCandidates.push(reverseCandidate);
+      }
+    }
+  }
+
+  return {
+    updates,
+    priorityCandidates,
+    recordedEvents: history.events,
+  };
+}
+
+async function dispatchSignals(bot, chatId, candidates, options = {}) {
+  const deduped = dedupeCandidates(candidates);
+  const prioritized = prioritizeCandidates(deduped, options.prioritySignalKeys || []);
+  if (!prioritized.length) return [];
+
+  const activeSignals = state.readJson(config.activeSignalsPath, {});
+  const results = [];
+
+  for (const candidate of prioritized) {
+    if (!candidate.validSignalEvent) continue;
+
+    const signalKey = buildSignalKey(candidate);
+    const previous = activeSignals[signalKey];
+
+    if (!previous) {
+      if (!candidate.entryEligible) continue;
+      if (!dryrun.canOpenNewSignal()) continue;
+
+      const tracked = dryrun.registerSignal({
+        ...candidate,
         signalKey,
       });
-      tradeManager.attachSignalMessage(
-        registered.trade.id || registered.trade.signalId,
-        sent?.message_id || null,
-        signalKey
-      );
+      if (!tracked) continue;
+
+      const sent = await sendNewSignal(bot, chatId, candidate);
+      dryrun.attachSignalMessage(tracked.signalId || tracked.id, sent?.message_id || null, signalKey);
+
       activeSignals[signalKey] = {
         ...candidate,
-        band,
         messageId: sent?.message_id || null,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      activePairs.add(pair);
-      dirty = true;
+
+      results.push({ type: "new", key: signalKey, candidate });
+      continue;
     }
 
-    if (registered.events?.length) {
-      await dispatchTradeUpdates(bot, chatId, registered.events, { profileId });
+    const previousRangeIndex = Number(previous.scoreRangeIndex);
+    const currentRangeIndex = Number(candidate.scoreRangeIndex);
+    const isHigherRange =
+      Number.isFinite(currentRangeIndex) &&
+      (!Number.isFinite(previousRangeIndex) || currentRangeIndex > previousRangeIndex);
+
+    if (candidate.momentumStatus === "continuation" && isHigherRange) {
+      await sendScoreRise(bot, chatId, previous, candidate);
+      activeSignals[signalKey] = {
+        ...previous,
+        ...candidate,
+        updatedAt: new Date().toISOString(),
+      };
+      results.push({ type: "rise", key: signalKey, candidate });
+      continue;
     }
 
-    results.push({
-      type: skipped ? "suppressed" : "new",
-      key: signalKey,
-      candidate,
-      reason: skipped ? registered.events?.find((event) => event.type === "TRADE_SKIPPED")?.reason : null,
-    });
+    activeSignals[signalKey] = {
+      ...previous,
+      ...candidate,
+      updatedAt: new Date().toISOString(),
+    };
   }
 
-  if (dirty) {
-    state.saveActiveSignals(profileId, activeSignals);
-  }
-
+  state.writeJson(config.activeSignalsPath, activeSignals);
   return results;
 }
 
-function eventMessage(update) {
-  switch (update.type) {
-    case "ORDER_PLACED":
-      return buildOrderPlacedMessage(update.trade, update.ack);
-    case "ENTRY_FILLED":
-      return buildEntryFilledMessage(update.trade);
-    case "PROTECTIVE_ORDERS_PLACED":
-      return buildProtectiveOrdersPlacedMessage(update.trade);
-    case "TARGET_HIT":
-      return buildTargetHitMessage(update.trade);
-    case "STOP_HIT":
-      return buildStopHitMessage(update.trade);
-    case "TRADE_SKIPPED":
-      return buildTradeSkippedMessage(update);
-    case "ORDER_REJECTED":
-      return buildOrderRejectedMessage(update);
-    case "PROFIT_SWEPT":
-      return buildProfitSweptMessage(update);
-    case "ENTRY_CANCELED_BEFORE_FILL":
-      return buildEntryCanceledBeforeFillMessage(update.trade);
-    case "ENTRY_TIMEOUT":
-      return buildEntryTimeoutMessage(update.trade);
-    case "RECONCILIATION_COMPLETE":
-      return buildReconciliationCompleteMessage(update.summary || update);
-    default:
-      return "";
-  }
-}
+async function dispatchTradeUpdates(bot, chatId, updates) {
+  if (!bot || !chatId || !Array.isArray(updates) || !updates.length) return [];
 
-function isTerminalEvent(update) {
-  return [
-    "TARGET_HIT",
-    "STOP_HIT",
-    "ORDER_REJECTED",
-    "ENTRY_CANCELED_BEFORE_FILL",
-    "ENTRY_TIMEOUT",
-  ].includes(update.type);
-}
-
-async function dispatchTradeUpdates(bot, chatId, updates, options = {}) {
-  const profileId = options.profileId || state.DEFAULT_PROFILE_ID;
-  if (!bot || !Array.isArray(updates) || !updates.length) return [];
-
-  const activeSignals = state.getActiveSignals(profileId);
-  const privateChatId = state.getPrivateChatId(profileId);
+  const activeSignals = state.readJson(config.activeSignalsPath, {});
   const sent = [];
   let dirty = false;
 
-  if (!privateChatId) {
-    logPrivateDeliveryIssue(
-      profileId,
-      "Cannot send private message to user because user has not started the bot.",
-      { scope: "user-trade-update-batch" }
-    );
-  }
-
   for (const update of updates) {
-    const trade = update.trade || {};
-    const text = eventMessage(update);
+    const position = update.position || update;
+    const replyTo = position.signalMessageId || position.messageId || null;
 
-    if (!text) continue;
-
-    if (privateChatId) {
-      try {
-        const message = await sendUserTradeUpdate(bot, profileId, text, {
-          scope: update.type || "user-trade-update",
-          chatId: privateChatId,
-        });
-        if (message) {
-          sent.push(message);
-        }
-      } catch (error) {
-        console.error(`Private trade update failed for ${profileId}:`, error.message);
-      }
+    let text = "";
+    if (update.type === "TARGET ACHIEVED") {
+      text = buildTargetHitMessage(position);
+    } else if (update.type === "SL HIT") {
+      text = buildStopHitMessage(position);
+    } else if (update.type === "FORCE CLOSED") {
+      text = buildForceClosedMessage(position);
+    } else {
+      continue;
     }
 
-    const signalKey = trade.signalKey || update.candidate?.signalKey || null;
-    if (isTerminalEvent(update)) {
-      if (signalKey && activeSignals[signalKey]) {
-        delete activeSignals[signalKey];
-        dirty = true;
-      }
+    const message = await bot.sendMessage(
+      chatId,
+      text,
+      replyTo ? { reply_to_message_id: replyTo } : {}
+    );
+    sent.push(message);
 
-      const pair = String(trade.pair || update.candidate?.pair || "").toUpperCase();
-      if (pair) {
-        for (const [key, value] of Object.entries(activeSignals)) {
-          if (String(value?.pair || "").toUpperCase() === pair) {
-            delete activeSignals[key];
-            dirty = true;
-          }
-        }
-      }
+    const signalKey = position.signalKey || buildSignalKey(position);
+    if (
+      activeSignals[signalKey] &&
+      (!position.signalMessageId || activeSignals[signalKey].messageId === position.signalMessageId)
+    ) {
+      delete activeSignals[signalKey];
+      dirty = true;
     }
   }
 
   if (dirty) {
-    state.saveActiveSignals(profileId, activeSignals);
+    state.writeJson(config.activeSignalsPath, activeSignals);
   }
 
   return sent;
@@ -673,10 +960,13 @@ async function dispatchTradeUpdates(bot, chatId, updates, options = {}) {
 
 module.exports = {
   buildSignalCandidate,
-  dispatchPublicSignal,
-  registerSignalForProfile,
-  syncPublicSignalStatus,
+  buildSignalKey,
+  dedupeCandidates,
   dispatchSignals,
   dispatchTradeUpdates,
-  buildSignalKey,
+  evaluateInternalMarketClosures,
+  getScoreRangeIndex,
+  getScoreRangeLabel,
+  evaluateTopBottomEntrySetup,
+  prepareSignalCandidates,
 };

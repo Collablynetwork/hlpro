@@ -1,165 +1,57 @@
-# Hyperliquid Scanner & Trader
+# Binance Futures Pump Fingerprint Bot
 
-This project scans watched Hyperliquid perpetual pairs, learns long/short fingerprints from recent moves, sends Telegram alerts, and can trade in either `REAL` or `DEMO` execution mode with separate `SIMPLE` and `COMPOUNDING` capital modes.
+This project scans watched Binance USDⓈ-M Futures pairs, studies pumped or dumped setups from a configurable recent-day window, saves strategy fingerprints, compares them against current multi-timeframe conditions, and sends Telegram alerts for LONG and SHORT dry-run trades.
 
-## Key upgrades
+## What it does
 
-- Hyperliquid links and inline buttons on signal/trade messages
-- Two independent runtime mode families:
-  - Capital mode: `SIMPLE`, `COMPOUNDING`
-  - Execution mode: `REAL`, `DEMO`
-- Strict mode lock while trades are still active/pending/protected/reconciling
-- Durable per-profile runtime settings in SQLite
-- Telegram-first runtime control surface for pairs, modes, balances, reconciliation, automation, and strategy maintenance
-- Dynamic pair management validated against Hyperliquid metadata
-- Separate PnL views by execution mode and capital mode
-- Safe multi-user automation onboarding with masked admin review and encrypted agent secrets at rest
-- Restart-safe reconciliation and TP/SL re-arming
-- Weekly strategy pruning with archive output
+- Reads watched pairs from `pair.js` and `storage/pairs.json`
+- Lets you add and remove pairs using Telegram commands
+- Scans every minute
+- Reads all requested timeframes: `1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w`
+- Learns from pumped and dumped tokens in the last kept N days
+- Stores learned strategies in `storage/strategies/*.json`
+- Automatically deletes saved strategies older than the configured retention window
+- Scores current LONG and SHORT candidates
+- Sends Telegram alerts and score-rise replies
+- Tracks dry-run PNL, TP, and SL
 
-## Storage
+## Install
 
-- SQLite DB: `storage/bot-state.sqlite`
-- Strategy exports and prune archives: `storage/exports/*.txt`
-- Legacy JSON files are read once for migration where possible
+```bash
+npm install
+```
 
-## Required environment
+## Environment
 
-Set Telegram plus Hyperliquid values in `.env`.
+Create `.env` from `.env.example`.
 
-Core bot values:
+## Run
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- `TELEGRAM_ADMIN_IDS=12345,67890`
-- `BOT_STATE_ENCRYPTION_KEY=...`
-
-Legacy/default live wallet values for the default system profile:
-
-- `HYPERLIQUID_SECRET_KEY`
-- `HYPERLIQUID_ACCOUNT_ADDRESS`
-- `HYPERLIQUID_VAULT_ADDRESS`
-
-Useful runtime defaults:
-
-- `DEFAULT_TRADE_LEVERAGE=10`
-- `DEFAULT_TRADE_BALANCE=100`
-- `DEFAULT_CAPITAL_MODE=SIMPLE`
-- `DEFAULT_EXECUTION_MODE=DEMO`
-- `DEFAULT_SIMPLE_SLOTS=1`
-- `DEFAULT_DEMO_BALANCE=100`
-- `FORCE_MODE_CHANGE_ENABLED=false`
+```bash
+npm start
+```
 
 ## Main Telegram commands
-
-General:
-
-- `/help`
-- `/status`
-- `/scan`
-- `/positions`
-- `/closed`
-- `/pnl`
-- `/balance`
-
-Capital mode:
-
-- `/capitalmode`
-- `/setcapitalmode simple`
-- `/setcapitalmode compounding`
-- `/principal`
-- `/setprincipal 100`
-- `/slots`
-- `/setslots 2`
-- `/capitalstatus`
-- `/sweepstatus`
-
-Execution mode:
-
-- `/executionmode`
-- `/setexecutionmode real`
-- `/setexecutionmode demo`
-- `/demobalance`
-- `/setdemobalance 100`
-- `/realstatus`
-- `/demostatus`
-
-Trading controls:
-
-- `/autotrade on`
-- `/autotrade off`
-- `/tradebalance`
-- `/settradebalance 100`
-- `/leverage`
-- `/setleverage 10`
-- `/dryrun`
-- `/dryrunlong`
-- `/dryrunshort`
-- `/dryrunpair BTCUSDT long`
-
-Pairs:
 
 - `/pairs`
 - `/addpair BTCUSDT`
 - `/removepair BTCUSDT`
-- `/reloadpairs`
-- `/pairstatus BTCUSDT`
-
-Reconciliation:
-
-- `/reconcile`
-- `/reconcile me`
-- `/reconcile user <user>`
-- `/reconcileall`
-
-Automation onboarding:
-
-- `/connecttrading`
-- `/setwallet 0x...`
-- `/setagentaddress 0x...`
-- `/setagentprivatekey <secret>`
-- `/submitautomationrequest`
-- `/automationstatus`
-- `/disableautomation`
-- `/enableautomation`
-
-Admin:
-
-- `/pendingapprovals`
-- `/approveautomation <request_id>`
-- `/rejectautomation <request_id> <reason>`
-- `/removeautomation <user>`
-- `/disablewallet <user>`
-- `/enablewallet <user>`
-- `/listautomationusers`
-- `/viewuserconfig <user>`
-- `/forcesetcapitalmode <user> simple|compounding`
-- `/forcesetexecutionmode <user> real|demo`
-
-Strategy maintenance:
-
-- `/strategystatus`
-- `/strategytop`
-- `/strategyprune`
-- `/exportstrategies`
-- `/strategyexports`
-- `/importstrategies latest`
-- `/importstrategies strategies-1234567890.txt`
-- `/importstrategyfile /abs/path/file.json`
-- `/importstrategyfile replace /abs/path/file.txt`
-- `/strategyretention`
-- `/setstrategyretentiondays 7`
-- `/setstrategycap 500`
-- `/cleardemohistory`
-
-Legacy strategy utilities:
-
-- `/rebuildstrategies`
+- `/scan`
+- `/dryrun`
+- `/pnl`
+- `/signals`
+- `/closed`
+- `/cleartradehistory`
+- `/strategies`
+- `/strategylist`
+- `/strategy BTCUSDT`
+- `/recentstrategyday 3`
+- `/clearstrategy BTCUSDT`
+- `/clearallstrategy`
+- `/help`
 
 ## Notes
 
-- Hyperliquid metadata is the source of truth for tradable pair validation.
-- `pair.js` is now only a bootstrap default list, not a runtime allowlist gate.
-- `REAL` execution is blocked until the profile is approved and enabled.
-- Agent secrets are stored encrypted at rest and are never echoed back in Telegram.
-- In restricted sandboxes, live Hyperliquid and Telegram verification still needs testing in the target runtime environment.
+- This is dry-run only.
+- It uses Binance USDⓈ-M Futures public endpoints.
+- Your pasted `BINANCE_API_URL=https://api.binance.com/api/v3` is the spot base URL. For this project, use `https://fapi.binance.com`.

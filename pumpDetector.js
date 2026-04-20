@@ -4,7 +4,6 @@ const { detectStructure } = require("./structure");
 function getMoveThresholdByTimeframe(timeframe) {
   const map = {
     "1m": 0.8,
-    "3m": 1.0,
     "5m": 1.2,
     "15m": 1.8,
     "30m": 2.2,
